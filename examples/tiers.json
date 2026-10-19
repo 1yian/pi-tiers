@@ -1,0 +1,34 @@
+{
+  "accounts": {
+    "claude": ["anthropic", "anthropic-2"]
+  },
+  "tiers": {
+    "default": {
+      "description": "Build or fix from a known plan, spec, issue, or reproduction; deploys, merges, rollouts, and other production changes; anything that does not clearly fit another tier.",
+      "chain": ["claude/claude-sonnet-5-5:high", "claude/claude-opus-5-5:low", "openai-codex/gpt-6.1-sol:xhigh", "opencode/deepseek-v4.1-flash:high"]
+    },
+    "deep": {
+      "description": "Plan, research, investigate, root-cause, evaluate, or design when there is no verified plan yet; open-ended analysis, evals, and data investigation.",
+      "chain": ["claude/claude-opus-5-5:xhigh", "openai-codex/gpt-6-astra:high", "opencode/deepseek-v4.1-flash:high"]
+    },
+    "quick": {
+      "description": "Small bounded chores with an obvious path: docs, config, renames, small cosmetic edits, simple cleanups.",
+      "chain": ["claude/claude-haiku-5-5:max", "openai-codex/gpt-6-luna:max", "opencode/deepseek-v4.1-flash:high"]
+    }
+  },
+  "auto": {
+    "classifier": "typesafe/jev-latest",
+    "tiers": ["default", "deep", "quick"],
+    "fallback": "default",
+    "minConfidence": 0.6
+  },
+  "rules": [
+    {
+      "name": "work",
+      "match": { "gitRemote": "github\\.com[:/]my-employer/" },
+      "allowProviders": ["anthropic"]
+    }
+  ],
+  "override": "^Model override:\\s*(\\S+)(?:\\s+(\\S+))?",
+  "warnProviders": ["opencode"]
+}
