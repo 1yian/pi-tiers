@@ -96,10 +96,21 @@ export default function piTiers(pi: ExtensionAPI): void {
 		return list;
 	};
 
-	const ruleFor = (cwd: string): Rule | undefined =>
-		cfg.rules.find(
+	// PI_TIERS_RULE=<name> forces one rule for this process and the Pi processes it starts.
+	const forcedRule = process.env.PI_TIERS_RULE?.trim();
+	const forced = forcedRule ? cfg.rules.find((r) => r.name === forcedRule) : undefined;
+	if (forcedRule && !forced) {
+		pi.on("session_start", async (_event, ctx) => ctx.ui.notify(`pi-tiers: PI_TIERS_RULE=${forcedRule} names no rule in ${cfg.path}`, "error"));
+	}
+	const ruleFor = (cwd: string): Rule | undefined => {
+		if (forcedRule) {
+			if (!forced) throw new Error(`pi-tiers: PI_TIERS_RULE=${forcedRule} names no rule in ${cfg.path}`);
+			return forced;
+		}
+		return cfg.rules.find(
 			(r) => r.cwdPrefixes.some((p) => cwd === p || cwd.startsWith(`${p}/`)) || (r.gitRemote && gitRemotes(cwd).some((u) => r.gitRemote!.test(u))),
 		);
+	};
 
 	const checker =
 		(ctx: ExtensionContext, tokens: number, nowMs: number) =>

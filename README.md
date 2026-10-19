@@ -7,12 +7,13 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 - **`tier/auto`** classifies the first message of a session with a classifier model (for example TypeSafe's Jev) and stays on that tier for the session.
 - **Sticky within a turn, fail back between turns.** Tool follow-ups stay on the model that answered, keeping prompt caches warm; the next user message returns to the most preferred usable model.
 - **Rules** replace or filter chains by git remote or working directory, for example "work repos only use the work account".
+- **Forced rules.** `PI_TIERS_RULE=<name>` applies that rule wherever Pi runs, for example a `vertex-pi` wrapper that keeps a session on one cloud. An unknown name fails closed.
 - **Context-aware.** A model whose context window cannot hold the conversation is skipped instead of forcing a compaction.
 
 ## Install
 
 ```bash
-pi install git:github.com/1yian/pi-tiers@v0.1.0
+pi install git:github.com/1yian/pi-tiers@v0.1.1
 ```
 
 Then write `~/.pi/agent/tiers.json` (or point `PI_TIERS_CONFIG` at a file) and select a tier with `/model`, `--model tier/default`, or `/tier`.
@@ -29,7 +30,7 @@ See [`examples/tiers.json`](examples/tiers.json).
 | `auto.classifier` | `provider/model` of a Pi classifier model. |
 | `auto.tiers`, `auto.fallback`, `auto.minConfidence` | Tiers it may pick, the tier used when it is unsure or unavailable, and the confidence floor (default 0.6). |
 | `auto.sections`, `auto.maxChars` | Markdown headings whose sections are classified instead of the whole message, and a length cap. |
-| `rules[]` | `match.gitRemote` (regex) and/or `match.cwdPrefix`. `tiers` replaces chains in that context; `allowProviders` filters the other chains. |
+| `rules[]` | `name`, `match.gitRemote` (regex) and/or `match.cwdPrefix`. `tiers` replaces chains in that context; `allowProviders` filters the other chains and blocks overrides to other providers. Set `PI_TIERS_RULE=<name>` to force a rule regardless of directory. |
 | `override` | Regex for an explicit model line in the first message, e.g. `Model override: anthropic/claude-opus-5-5 max`. Group 1 is `provider/model`, group 2 the thinking level. |
 | `warnProviders` | Providers flagged as last resorts in the status line. |
 | `cooldowns` | Fallback durations in seconds when a response carries no reset header: `rateLimitSeconds` (600), `serverErrorSeconds` (30), `usageLimitSeconds` (3600), `authSeconds` (3600). |

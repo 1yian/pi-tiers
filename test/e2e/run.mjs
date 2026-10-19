@@ -38,14 +38,21 @@ function makeHome(name) {
 	return dir;
 }
 
-function runPi(home, { model, prompt, plan = {}, classify, cwd = home }) {
+function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {} }) {
 	const calls = join(home, "calls.tsv");
 	const before = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0;
 	const res = spawnSync("pi", ["--mode", "json", "--offline", "--no-skills", "--no-context-files", "--model", model, "-e", EXT, "-e", FAKE, prompt], {
 		cwd,
 		encoding: "utf8",
 		timeout: 60_000,
-		env: { ...process.env, PI_CODING_AGENT_DIR: home, FAKE_CALLS: calls, FAKE_PLAN: JSON.stringify(plan), FAKE_CLASSIFY: JSON.stringify(classify ?? {}) },
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: home,
+			FAKE_CALLS: calls,
+			FAKE_PLAN: JSON.stringify(plan),
+			FAKE_CLASSIFY: JSON.stringify(classify ?? {}),
+			...env,
+		},
 	});
 	const events = res.stdout
 		.split("\n")
@@ -200,6 +207,16 @@ scenario("a rule matched by git remote replaces the chain", () => {
 	execFileSync("git", ["-C", repo, "remote", "add", "origin", "git@github.com:acme-corp/service.git"]);
 	const r = runPi(home, { model: "tier/default", prompt: "hello", cwd: repo });
 	return check(answered(r) === "fake-c/m2" && r.routes.at(-1)?.rule === "acme", r);
+});
+
+scenario("PI_TIERS_RULE forces a rule outside its matching repos", () => {
+	const r = runPi(makeHome("forced-rule"), { model: "tier/default", prompt: "hello", env: { PI_TIERS_RULE: "acme" } });
+	return check(answered(r) === "fake-c/m2" && r.routes.at(-1)?.rule === "acme", r);
+});
+
+scenario("PI_TIERS_RULE naming an unknown rule fails closed instead of using the base chain", () => {
+	const r = runPi(makeHome("forced-unknown"), { model: "tier/default", prompt: "hello", env: { PI_TIERS_RULE: "nope" } });
+	return check(r.final?.stopReason === "error" && r.calls.length === 0, r);
 });
 
 scenario("a model whose context window is too small is skipped", () => {
