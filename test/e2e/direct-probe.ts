@@ -4,18 +4,21 @@ import { writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+	const published: unknown[] = [];
+	pi.events.on("pi-tiers:route", (data) => published.push(data));
 	pi.registerCommand("direct-probe", {
 		description: "two direct tier requests",
 		handler: async (args, ctx) => {
 			const model = ctx.modelRegistry.find("tier", args.trim() || "default");
 			const results: string[] = [];
+			published.length = 0;
 			for (let i = 0; i < 2; i++) {
 				if (!model) break;
 				const stream = ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: Date.now() }] } as never, {});
 				const msg = await (stream as unknown as { result(): Promise<{ provider: string; model: string; stopReason: string }> }).result();
 				results.push(`${msg.provider}/${msg.model}:${msg.stopReason}`);
 			}
-			writeFileSync(process.env.DIRECT_OUT!, JSON.stringify(results));
+			writeFileSync(process.env.DIRECT_OUT!, JSON.stringify({ results, published }));
 		},
 	});
 }

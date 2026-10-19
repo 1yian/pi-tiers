@@ -13,7 +13,7 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 ## Install
 
 ```bash
-pi install git:github.com/1yian/pi-tiers@v0.1.3
+pi install git:github.com/1yian/pi-tiers@v0.1.4
 ```
 
 Then write `~/.pi/agent/tiers.json` (or point `PI_TIERS_CONFIG` at a file) and select a tier with `/model`, `--model tier/default`, or `/tier`.

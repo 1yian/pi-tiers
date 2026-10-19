@@ -230,14 +230,15 @@ scenario("PI_TIERS_RULE naming an unknown rule fails closed instead of using the
 	return check(r.final?.stopReason === "error" && r.calls.length === 0, r);
 });
 
-scenario("direct requests (compaction, extension calls) skip models cooled by an earlier agent-loop failure", () => {
+scenario("direct requests (compaction, extension calls) skip models cooled by an earlier agent-loop failure and leave the status line alone", () => {
 	const home = makeHome("direct");
 	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429"] } });
 	const out = join(home, "direct.json");
 	const r = runPi(home, { model: "tier/default", prompt: "/direct-probe default", env: { DIRECT_OUT: out }, extra: ["-e", DIRECT] });
-	const results = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : [];
-	r.direct = results;
-	return check(results.length === 2 && results.every((x) => x === "fake-b/m1:stop") && r.routes.at(-1)?.reason === "direct", r);
+	const { results = [], published = ["missing"] } = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
+	r.direct = { results, published };
+	// Direct requests must not overwrite the session's status line route.
+	return check(results.length === 2 && results.every((x) => x === "fake-b/m1:stop") && r.routes.at(-1)?.reason === "direct" && published.length === 0, r);
 });
 
 scenario("a model whose context window is too small is skipped", () => {

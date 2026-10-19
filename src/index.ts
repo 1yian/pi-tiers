@@ -184,7 +184,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 		if (!result.chosen) {
 			const why = result.skipped.map((s) => `${s.key}: ${s.reason}`).join(", ") || "empty chain";
-			publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → no model available`);
+			if (req.reason !== "direct") publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → no model available`);
 			log({ event: "route", selected, tier, reason: req.reason, chosen: null, skipped: result.skipped });
 			throw new Error(`pi-tiers: no usable model for tier '${tier}' (${why})`);
 		}
@@ -193,17 +193,20 @@ export default function piTiers(pi: ExtensionAPI): void {
 		state.key = candidateKey(chosen);
 		lastRouteKey = state.key;
 
-		publish(ctx, {
-			selected,
-			tier,
-			auto: state.auto ? { confidence: state.auto.confidence, unsure: Boolean(state.auto.fallback) } : undefined,
-			provider: chosen.provider,
-			model: chosen.model,
-			thinking: chosen.thinking,
-			position: chosen.position,
-			warn: cfg.warnProviders.has(chosen.provider),
-			rule: rule?.name,
-		});
+		// The status line describes the conversation, so direct requests (compaction, extension calls
+		// on other tiers) are logged but never published over the session's own route.
+		if (req.reason !== "direct")
+			publish(ctx, {
+				selected,
+				tier,
+				auto: state.auto ? { confidence: state.auto.confidence, unsure: Boolean(state.auto.fallback) } : undefined,
+				provider: chosen.provider,
+				model: chosen.model,
+				thinking: chosen.thinking,
+				position: chosen.position,
+				warn: cfg.warnProviders.has(chosen.provider),
+				rule: rule?.name,
+			});
 		log({
 			event: "route",
 			session: ctx.sessionManager.getSessionId(),
