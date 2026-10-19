@@ -13,7 +13,7 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 ## Install
 
 ```bash
-pi install git:github.com/1yian/pi-tiers@v0.1.4
+pi install git:github.com/1yian/pi-tiers@v0.1.5
 ```
 
 Then write `~/.pi/agent/tiers.json` (or point `PI_TIERS_CONFIG` at a file) and select a tier with `/model`, `--model tier/default`, or `/tier`.
@@ -41,7 +41,7 @@ See [`examples/tiers.json`](examples/tiers.json).
 1. `auto` decides the tier on the first user message and stores it as session state.
 2. A `Model override:` line, when configured and present, is tried first.
 3. The chain for the tier comes from the first matching rule, otherwise the base config.
-4. Candidates are skipped when the model is unknown, has no credentials, is cooling down, or cannot fit the conversation.
+4. Candidates are skipped when the model is unknown, has no credentials, is cooling down, or cannot fit the conversation. If every usable candidate is only too small, the one with the largest context window is used and Pi compacts the conversation before sending, instead of the request failing.
 5. Retries after a failure first record the cooldown. Failures Pi does not retry (usage limits, exhausted retries) are cooled down too, and the turn continues on the next usable model with a visible note.
 
 Direct requests (compaction summaries and extension calls through the model registry) are routed the same way, but Pi does not report their failures to extensions, so they benefit only from cooldowns recorded by agent-loop requests, in this or any other Pi process.

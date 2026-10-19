@@ -37,23 +37,35 @@ export interface PickInput {
 	/** Key of the candidate to keep when it is still usable (stickiness within a turn). */
 	prefer?: string;
 	check: (c: Candidate) => SkipReason | undefined;
+	/** Context window of a candidate's model, used to pick the largest one when every usable rung is too small. */
+	contextWindow?: (c: Candidate) => number;
 }
 
 export interface PickResult {
 	chosen?: Candidate;
 	skipped: Array<{ key: string; reason: SkipReason }>;
+	/** Set when no rung fit the conversation and the largest usable one was chosen so Pi compacts first. */
+	compacting?: boolean;
 }
 
-export function pick({ candidates, prefer, check }: PickInput): PickResult {
+export function pick({ candidates, prefer, check, contextWindow }: PickInput): PickResult {
 	const skipped: PickResult["skipped"] = [];
 	if (prefer) {
 		const sticky = candidates.find((c) => candidateKey(c) === prefer);
 		if (sticky && !check(sticky)) return { chosen: sticky, skipped };
 	}
+	const tooSmall: Candidate[] = [];
 	for (const c of candidates) {
 		const reason = check(c);
 		if (!reason) return { chosen: c, skipped };
 		skipped.push({ key: candidateKey(c), reason });
+		if (reason === "context-too-small") tooSmall.push(c);
+	}
+	// Every usable rung is only too small: take the largest window and let Pi compact before sending,
+	// rather than failing a request that a compacted conversation could still serve.
+	if (tooSmall.length && contextWindow) {
+		const largest = tooSmall.reduce((best, c) => (contextWindow(c) > contextWindow(best) ? c : best));
+		return { chosen: largest, skipped, compacting: true };
 	}
 	return { skipped };
 }

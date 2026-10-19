@@ -123,6 +123,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 			return undefined;
 		};
 
+	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
+
 	const noteFailure = (provider: string, model: string, errorMessage: string, ctx: ExtensionContext): Failure | undefined => {
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
@@ -180,7 +182,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 		const sticky = req.reason === "user" ? undefined : (state.key ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined));
 		const tokens = ctx.getContextUsage()?.tokens ?? estimateTokens(req.messages);
-		const result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs) });
+		const result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
 
 		if (!result.chosen) {
 			const why = result.skipped.map((s) => `${s.key}: ${s.reason}`).join(", ") || "empty chain";
@@ -218,6 +220,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			skipped: result.skipped,
 			rule: rule?.name,
 			tokens,
+			...(result.compacting ? { compacting: true } : {}),
 		});
 
 		const changed = JSON.stringify(state) !== JSON.stringify(previous);

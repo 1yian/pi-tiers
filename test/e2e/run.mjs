@@ -20,6 +20,7 @@ const TIERS = {
 		default: { description: "Build or fix from a known plan.", chain: ["fake/m1:high", "fake-c/m2:low"] },
 		deep: { description: "Research and investigation.", chain: ["fake-c/m2:xhigh"] },
 		big: { description: "Context test.", chain: ["fake-small/tiny:low", "fake-c/m2:low"] },
+		small: { description: "Only a small window.", chain: ["fake-small/tiny:low"] },
 	},
 	auto: { classifier: "fake-cls/jev", tiers: ["default", "deep"], fallback: "default", minConfidence: 0.6, sections: ["## Captain's intent"] },
 	rules: [{ name: "acme", match: { gitRemote: "github\\.com[:/]acme-corp/" }, tiers: { default: ["fake-c/m2:max"] } }],
@@ -42,19 +43,37 @@ function makeHome(name) {
 function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {}, extra = [] }) {
 	const calls = join(home, "calls.tsv");
 	const before = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0;
-	const res = spawnSync("pi", ["--mode", "json", "--offline", "--no-skills", "--no-context-files", "--model", model, "-e", EXT, "-e", FAKE, ...extra, prompt], {
-		cwd,
-		encoding: "utf8",
-		timeout: 60_000,
-		env: {
-			...process.env,
-			PI_CODING_AGENT_DIR: home,
-			FAKE_CALLS: calls,
-			FAKE_PLAN: JSON.stringify(plan),
-			FAKE_CLASSIFY: JSON.stringify(classify ?? {}),
-			...env,
+	const res = spawnSync(
+		"pi",
+		[
+			"--mode",
+			"json",
+			"--offline",
+			"--no-skills",
+			"--no-context-files",
+			"--model",
+			model,
+			"-e",
+			EXT,
+			"-e",
+			FAKE,
+			...extra,
+			...(Array.isArray(prompt) ? prompt : [prompt]),
+		],
+		{
+			cwd,
+			encoding: "utf8",
+			timeout: 60_000,
+			env: {
+				...process.env,
+				PI_CODING_AGENT_DIR: home,
+				FAKE_CALLS: calls,
+				FAKE_PLAN: JSON.stringify(plan),
+				FAKE_CLASSIFY: JSON.stringify(classify ?? {}),
+				...env,
+			},
 		},
-	});
+	);
 	const events = res.stdout
 		.split("\n")
 		.filter(Boolean)
@@ -245,6 +264,17 @@ scenario("a model whose context window is too small is skipped", () => {
 	const r = runPi(makeHome("context"), { model: "tier/big", prompt: `Summarize: ${"lorem ipsum dolor sit amet ".repeat(9000)}` });
 	const skipped = r.routes.at(-1)?.skipped?.some((s) => s.key === "fake-small/tiny" && s.reason === "context-too-small");
 	return check(answered(r) === "fake-c/m2" && skipped, r);
+});
+
+scenario("when every usable rung is too small, the largest one is used and Pi compacts instead of the request failing", () => {
+	// Two ~37K-token turns outgrow the only model's 64K window on the second turn.
+	const home = makeHome("compact-fallback");
+	const prompts = [`Remember: ${"lorem ipsum dolor sit amet ".repeat(5500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(5500)}`];
+	const r = runPi(home, { model: "tier/small", prompt: prompts });
+	const compaction = sessionEntries(home).find((e) => e.type === "compaction");
+	r.compaction = compaction && { tokensBefore: compaction.tokensBefore };
+	const routed = r.routes.some((x) => x.chosen === "fake-small/tiny" && x.compacting && x.reason === "user");
+	return check(routed && compaction && r.final?.stopReason === "stop", r);
 });
 
 scenario("the same small-window model is used when the conversation fits", () => {

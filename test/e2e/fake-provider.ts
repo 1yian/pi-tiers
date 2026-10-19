@@ -20,6 +20,10 @@ const ERRORS: Record<string, { status: number; message: string; headers?: Record
 	"403": { status: 403, message: '403: {"type":"FreeTierError","message":"free tier can only be used from within the vendor app"}' },
 };
 
+function inputTokens(context: unknown): number {
+	return Math.ceil(JSON.stringify((context as { messages?: unknown })?.messages ?? []).length / 4);
+}
+
 function nextOutcome(key: string): string {
 	const callsFile = process.env.FAKE_CALLS!;
 	const prior = existsSync(callsFile)
@@ -33,7 +37,7 @@ function nextOutcome(key: string): string {
 	return outcome;
 }
 
-function stream(model: Model<Api>, _context: unknown, options?: SimpleStreamOptions): AssistantMessageEventStream {
+function stream(model: Model<Api>, context: unknown, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const out = createAssistantMessageEventStream();
 	const key = `${model.provider}/${model.id}`;
 	(async () => {
@@ -43,7 +47,16 @@ function stream(model: Model<Api>, _context: unknown, options?: SimpleStreamOpti
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			// Report realistic input usage (about 4 characters per token) so Pi's context accounting,
+			// and with it compaction, sees the real conversation size.
+			usage: {
+				input: inputTokens(context),
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: inputTokens(context) + 5,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
 			stopReason: "pending",
 			timestamp: Date.now(),
 		};
