@@ -1,7 +1,7 @@
 // Turns a failed request into a cooldown decision. Pure: no I/O.
 import type { Cooldowns } from "./config.ts";
 
-export type FailureKind = "usage-limit" | "rate-limit" | "auth" | "server";
+export type FailureKind = "usage-limit" | "rate-limit" | "auth" | "forbidden" | "server";
 
 export interface Failure {
 	kind: FailureKind;
@@ -17,7 +17,9 @@ export interface ResponseInfo {
 
 const USAGE =
 	/usage.?limit|quota|insufficient_quota|billing|out of budget|available balance|GoUsageLimitError|FreeUsageLimitError|subscription_sharing_usage_limit|weekly limit|(?:5|five)[- ]hour|exceed(?:ed)? your (?:account'?s )?(?:rate|usage) limit/i;
-const AUTH = /\b(?:401|403)\b|unauthori[sz]ed|forbidden|invalid.?(?:api.?)?key|authentication|not logged in|token (?:has )?expired/i;
+const AUTH = /\b401\b|unauthori[sz]ed|invalid.?(?:api.?)?key|authentication|not logged in|token (?:has )?expired/i;
+/** 403 without an auth reason: this model is off limits for the account (disabled, free tier refused, region). */
+const FORBIDDEN = /\b403\b|forbidden|access is disabled|not allowed|FreeTierError|permission/i;
 const RATE = /\b429\b|rate.?limit|too many requests|resource.?exhausted/i;
 const SERVER =
 	/overloaded|\b5\d\d\b|server.?error|internal.?error|unavailable|at capacity|timed? ?out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|network/i;
@@ -30,7 +32,8 @@ export function classifyFailure(errorMessage: string, response: ResponseInfo | u
 	const reset = response ? resetFromHeaders(response.headers, nowMs) : undefined;
 	const until = (fallbackSeconds: number) => clamp(reset ?? nowMs + fallbackSeconds * 1000, nowMs);
 	if (USAGE.test(errorMessage)) return { kind: "usage-limit", scope: "account", untilMs: until(cooldowns.usageLimitSeconds) };
-	if (status === 401 || status === 403 || AUTH.test(errorMessage)) return { kind: "auth", scope: "account", untilMs: until(cooldowns.authSeconds) };
+	if (status === 401 || AUTH.test(errorMessage)) return { kind: "auth", scope: "account", untilMs: until(cooldowns.authSeconds) };
+	if (status === 403 || FORBIDDEN.test(errorMessage)) return { kind: "forbidden", scope: "model", untilMs: until(cooldowns.authSeconds) };
 	if (status === 429 || RATE.test(errorMessage)) return { kind: "rate-limit", scope: "model", untilMs: until(cooldowns.rateLimitSeconds) };
 	if (status >= 500 || SERVER.test(errorMessage)) return { kind: "server", scope: "model", untilMs: clamp(nowMs + cooldowns.serverErrorSeconds * 1000, nowMs) };
 	return undefined;

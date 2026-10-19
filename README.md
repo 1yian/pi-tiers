@@ -2,7 +2,7 @@
 
 Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a model, pick a class of work: `tier/default`, `tier/deep`, `tier/quick`, or `tier/auto`. Each tier is a [virtual model](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/virtual-models.md) that walks an ordered chain of models across your accounts:
 
-- **Failover across accounts and models.** A rate limit, usage limit, auth failure, or server error cools that account (or that model on it) down, and the request moves to the next usable rung.
+- **Failover across accounts and models.** A rate limit, usage limit, auth failure (401), refusal of one model (403), or server error cools that account (or that model on it) down, and the request moves to the next usable rung.
 - **Cooldowns are shared** by every Pi process on the machine, so one crewmate hitting a limit spares the others the wasted request.
 - **`tier/auto`** classifies the first message of a session with a classifier model (for example TypeSafe's Jev) and stays on that tier for the session.
 - **Sticky within a turn, fail back between turns.** Tool follow-ups stay on the model that answered, keeping prompt caches warm; the next user message returns to the most preferred usable model.
@@ -13,7 +13,7 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 ## Install
 
 ```bash
-pi install git:github.com/1yian/pi-tiers@v0.1.1
+pi install git:github.com/1yian/pi-tiers@v0.1.2
 ```
 
 Then write `~/.pi/agent/tiers.json` (or point `PI_TIERS_CONFIG` at a file) and select a tier with `/model`, `--model tier/default`, or `/tier`.

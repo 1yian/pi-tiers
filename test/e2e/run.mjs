@@ -163,6 +163,16 @@ scenario("non-retryable usage limit cools the account and continues on the next 
 	return check(ok, r);
 });
 
+scenario("a 403 on one model cools only that model, so the same account's next model still answers", () => {
+	const home = makeHome("forbidden");
+	const tiers = JSON.parse(readFileSync(join(home, "tiers.json"), "utf8"));
+	tiers.tiers.default.chain = ["fake-c/m1:low", "fake-c/m2:low"];
+	writeFileSync(join(home, "tiers.json"), JSON.stringify(tiers));
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-c/m1": ["403"] } });
+	const ok = answered(r) === "fake-c/m2" && r.cooldowns.includes("model:fake-c/m1") && !r.cooldowns.includes("account:fake-c");
+	return check(ok, r);
+});
+
 scenario("whole account group down falls to the next chain entry (warn provider)", () => {
 	const r = runPi(makeHome("groupdown"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"], "fake-b/m1": ["usage"] } });
 	return check(answered(r) === "fake-c/m2" && r.routes.at(-1)?.position === 3, r);

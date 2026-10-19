@@ -5,6 +5,7 @@
 //   usage   non-retryable usage limit (Pi does not retry it)
 //   500     retryable server error
 //   401     authentication failure
+//   403     model refused for this account (not an auth failure)
 // The classifier answers with $FAKE_CLASSIFY ({"choice","confidence"} or {"error": "..."}).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -16,6 +17,7 @@ const ERRORS: Record<string, { status: number; message: string; headers?: Record
 	usage: { status: 429, message: "FreeUsageLimitError: free usage limit reached for this account" },
 	"500": { status: 500, message: "500 Internal server error" },
 	"401": { status: 401, message: "401 authentication_error: invalid x-api-key" },
+	"403": { status: 403, message: '403: {"type":"FreeTierError","message":"free tier can only be used from within the vendor app"}' },
 };
 
 function nextOutcome(key: string): string {
