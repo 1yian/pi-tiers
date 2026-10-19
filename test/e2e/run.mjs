@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const EXT = join(ROOT, "src/index.ts");
 const FAKE = join(ROOT, "test/e2e/fake-provider.ts");
+const DIRECT = join(ROOT, "test/e2e/direct-probe.ts");
 const OUT = join(ROOT, `.e2e-${new Date().toISOString().replace(/[:.]/g, "-")}`);
 mkdirSync(OUT, { recursive: true });
 
@@ -38,10 +39,10 @@ function makeHome(name) {
 	return dir;
 }
 
-function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {} }) {
+function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {}, extra = [] }) {
 	const calls = join(home, "calls.tsv");
 	const before = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0;
-	const res = spawnSync("pi", ["--mode", "json", "--offline", "--no-skills", "--no-context-files", "--model", model, "-e", EXT, "-e", FAKE, prompt], {
+	const res = spawnSync("pi", ["--mode", "json", "--offline", "--no-skills", "--no-context-files", "--model", model, "-e", EXT, "-e", FAKE, ...extra, prompt], {
 		cwd,
 		encoding: "utf8",
 		timeout: 60_000,
@@ -227,6 +228,16 @@ scenario("PI_TIERS_RULE forces a rule outside its matching repos", () => {
 scenario("PI_TIERS_RULE naming an unknown rule fails closed instead of using the base chain", () => {
 	const r = runPi(makeHome("forced-unknown"), { model: "tier/default", prompt: "hello", env: { PI_TIERS_RULE: "nope" } });
 	return check(r.final?.stopReason === "error" && r.calls.length === 0, r);
+});
+
+scenario("direct requests (compaction, extension calls) skip models cooled by an earlier agent-loop failure", () => {
+	const home = makeHome("direct");
+	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429"] } });
+	const out = join(home, "direct.json");
+	const r = runPi(home, { model: "tier/default", prompt: "/direct-probe default", env: { DIRECT_OUT: out }, extra: ["-e", DIRECT] });
+	const results = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : [];
+	r.direct = results;
+	return check(results.length === 2 && results.every((x) => x === "fake-b/m1:stop") && r.routes.at(-1)?.reason === "direct", r);
 });
 
 scenario("a model whose context window is too small is skipped", () => {

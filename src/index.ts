@@ -231,8 +231,32 @@ export default function piTiers(pi: ExtensionAPI): void {
 		});
 	}
 
+	// Agent-loop requests report their HTTP status here before Pi decides whether to retry, so the
+	// cooldown exists even when the retry budget runs out. Direct requests (compaction summaries,
+	// extension calls through the registry) do not emit this event; they are protected only by
+	// cooldowns that agent-loop requests in this or another process already recorded.
 	pi.on("after_provider_response", async (event) => {
-		lastResponse = { status: event.status, headers: event.headers, key: lastRouteKey, atMs: Date.now() };
+		const nowMs = Date.now();
+		lastResponse = { status: event.status, headers: event.headers, key: lastRouteKey, atMs: nowMs };
+		const failing = event.status === 401 || event.status === 403 || event.status === 429 || event.status >= 500;
+		if (!failing || !lastRouteKey) return;
+		const slash = lastRouteKey.indexOf("/");
+		const provider = lastRouteKey.slice(0, slash);
+		const model = lastRouteKey.slice(slash + 1);
+		const failure = classifyFailure("", { status: event.status, headers: event.headers }, cfg.cooldowns, nowMs);
+		if (!failure) return;
+		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
+		if ((store.get(storeKey, nowMs)?.untilMs ?? 0) >= failure.untilMs) return;
+		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind });
+		log({
+			event: "failure",
+			source: "response",
+			key: lastRouteKey,
+			kind: failure.kind,
+			scope: failure.scope,
+			until: new Date(failure.untilMs).toISOString(),
+			status: event.status,
+		});
 	});
 
 	pi.on("agent_start", async () => {
