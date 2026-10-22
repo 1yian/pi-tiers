@@ -7,6 +7,7 @@
 //   401     authentication failure
 //   403     model refused for this account (not an auth failure)
 //   timeout the request times out without an HTTP response (Pi retries it)
+//   connection the connection drops without an HTTP response (Pi retries it)
 // The classifier answers with $FAKE_CLASSIFY ({"choice","confidence"} or {"error": "..."}).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -20,6 +21,8 @@ const ERRORS: Record<string, { status: number; message: string; headers?: Record
 	"401": { status: 401, message: "401 authentication_error: invalid x-api-key" },
 	"403": { status: 403, message: '403: {"type":"FreeTierError","message":"free tier can only be used from within the vendor app"}' },
 };
+
+const NO_RESPONSE: Record<string, string> = { timeout: "Request timed out.", connection: "Connection error." };
 
 function inputTokens(context: unknown): number {
 	return Math.ceil(JSON.stringify((context as { messages?: unknown })?.messages ?? []).length / 4);
@@ -62,9 +65,9 @@ function stream(model: Model<Api>, context: unknown, options?: SimpleStreamOptio
 			timestamp: Date.now(),
 		};
 		const outcome = nextOutcome(key);
-		if (outcome === "timeout") {
+		if (outcome in NO_RESPONSE) {
 			message.stopReason = "error";
-			message.errorMessage = "Request timed out.";
+			message.errorMessage = NO_RESPONSE[outcome];
 			out.push({ type: "error", reason: "error", error: message });
 			out.end();
 			return;

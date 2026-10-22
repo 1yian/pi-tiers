@@ -300,6 +300,15 @@ scenario("a timeout is retried on the same account, where the prompt cache is, i
 	return check(answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:timeout,fake-a/m1:ok" && r.cooldowns.length === 0, r);
 });
 
+scenario("a dropped connection moves on to the next account once Pi's retries run out", () => {
+	const r = runPi(makeHome("connection"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] } });
+	const ok =
+		answered(r) === "fake-b/m1" &&
+		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-b/m1:ok" &&
+		r.cooldowns.includes("model:fake-a/m1");
+	return check(ok, r);
+});
+
 scenario("background work never uses an account kept for the user", () => {
 	const home = withTiers(makeHome("background-skip"), (t) => {
 		t.background = { skip: ["fake-a"] };
