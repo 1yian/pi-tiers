@@ -4,7 +4,14 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import { type ExtensionAPI, type ExtensionContext, getAgentDir, type ModelRoute, type ModelRouteRequest } from "@earendil-works/pi-coding-agent";
+import {
+	type ExtensionAPI,
+	type ExtensionContext,
+	estimateTokens as estimateMessageTokens,
+	getAgentDir,
+	type ModelRoute,
+	type ModelRouteRequest,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AutoDecision, decideTier, lastUserText, messageText } from "./auto.ts";
 import { type Candidate, candidateKey, candidatesFor, pick, type SkipReason } from "./chain.ts";
@@ -34,7 +41,7 @@ interface TierState {
 	auto?: AutoDecision;
 	/** null once the first message was checked and carried no override. */
 	override?: Override | null;
-	/** provider/model that answered last, kept within a turn for prompt-cache reuse. */
+	/** provider/model that answered last; the session keeps using it while it stays usable, for prompt-cache reuse. */
 	key?: string;
 }
 
@@ -65,9 +72,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 	const store = new CooldownStore(cfg.stateDir);
 	const remotes = new Map<string, string[]>();
 	let lastRouteKey: string | undefined;
+	// Last model chosen per session and tier. Direct requests (compaction, extension calls) carry no
+	// router state, so this is what keeps them on the account that is already working.
+	const served = new Map<string, string>();
 	let lastResponse: (ResponseInfo & { key?: string; atMs: number }) | undefined;
 	let lastTier: string | undefined;
 	let lastAssistant: AssistantMessage | undefined;
+	// Size of the most recent request, for choosing a model to continue a failed run on.
+	let lastTokens = 0;
 	let continues = 0;
 	const pending: string[] = [];
 
@@ -180,8 +192,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider))) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
-		const sticky = req.reason === "user" ? undefined : (state.key ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined));
-		const tokens = ctx.getContextUsage()?.tokens ?? estimateTokens(req.messages);
+		// Stay on the model that last served this session and tier until it cools, fails, or cannot fit
+		// the conversation; a higher-priority rung whose cooldown ended does not pull the session back.
+		const servedKey = `${ctx.sessionManager.getSessionId()}\0${tier}`;
+		const sticky = state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined);
+		const tokens = requestTokens(req.messages);
+		lastTokens = tokens;
 		const result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
 
 		if (!result.chosen) {
@@ -193,6 +209,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const chosen = result.chosen;
 		const model = ctx.modelRegistry.find(chosen.provider, chosen.model)!;
 		state.key = candidateKey(chosen);
+		served.set(servedKey, state.key);
 		lastRouteKey = state.key;
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
@@ -288,7 +305,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (!failure || !lastTier) return;
 		const nowMs = Date.now();
 		const rule = ruleFor(ctx.cwd);
-		const next = pick({ candidates: candidatesFor(cfg, lastTier, rule), check: checker(ctx, ctx.getContextUsage()?.tokens ?? 0, nowMs) }).chosen;
+		const next = pick({ candidates: candidatesFor(cfg, lastTier, rule), check: checker(ctx, lastTokens, nowMs) }).chosen;
 		if (!next) return;
 		continues++;
 		return {
@@ -363,8 +380,23 @@ function parseOverride(pattern: RegExp, text: string): Override | null {
 	};
 }
 
-function estimateTokens(messages: readonly Message[]): number {
-	let chars = 0;
-	for (const m of messages) chars += JSON.stringify((m as { content?: unknown }).content ?? "").length;
-	return Math.ceil(chars / 4);
+/**
+ * Size of what this request sends. Pi's own session figure is not used: after an edit to the
+ * context it re-estimates the whole stored branch, which can be many times what the request carries.
+ * Starts from the last real response's reported usage and adds the messages after it; without one,
+ * estimates every message the way Pi does (images at a fixed size, signatures not counted).
+ */
+function requestTokens(messages: readonly Message[]): number {
+	let start = 0;
+	let tokens = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const m = messages[i];
+		if (m.role === "assistant" && m.stopReason !== "error" && m.stopReason !== "aborted" && m.usage?.totalTokens > 0) {
+			tokens = m.usage.totalTokens;
+			start = i + 1;
+			break;
+		}
+	}
+	for (const m of messages.slice(start)) tokens += estimateMessageTokens(m);
+	return tokens;
 }
