@@ -305,9 +305,15 @@ scenario("background work never uses an account kept for the user", () => {
 		t.background = { skip: ["fake-a"] };
 	});
 	const background = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
+	const overridden = runPi(home, { model: "tier/default", prompt: "Model override: fake-a/m1\nhello", env: { PI_TIERS_BACKGROUND: "1" } });
 	const foreground = runPi(home, { model: "tier/default", prompt: "hello" });
-	const ok = answered(background) === "fake-b/m1" && background.calls.join() === "fake-b/m1:ok" && answered(foreground) === "fake-a/m1";
-	return check(ok, { background, foreground });
+	const ok =
+		answered(background) === "fake-b/m1" &&
+		background.calls.join() === "fake-b/m1:ok" &&
+		answered(overridden) === "fake-b/m1" &&
+		overridden.calls.join() === "fake-b/m1:ok" &&
+		answered(foreground) === "fake-a/m1";
+	return check(ok, { background, overridden, foreground });
 });
 
 scenario("background work waits for a cooling account instead of failing or falling to the next rung", () => {
@@ -349,9 +355,16 @@ scenario("with spread on, sessions start on different accounts of a group", () =
 	const home = withTiers(makeHome("spread"), (t) => {
 		t.spread = true;
 	});
-	const firsts = [];
-	for (let i = 0; i < 12; i++) firsts.push(answered(runPi(home, { model: "tier/default", prompt: `hello ${i}` })));
-	return check(firsts.includes("fake-a/m1") && firsts.includes("fake-b/m1") && firsts.every((f) => f === "fake-a/m1" || f === "fake-b/m1"), { firsts });
+	const expected = {
+		"00000000-0000-4000-8000-000000000001": "fake-a/m1",
+		"00000000-0000-4000-8000-000000000002": "fake-b/m1",
+		"00000000-0000-4000-8000-000000000003": "fake-a/m1",
+		"00000000-0000-4000-8000-000000000004": "fake-b/m1",
+	};
+	const firsts = Object.fromEntries(
+		Object.keys(expected).map((id) => [id, answered(runPi(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] }))]),
+	);
+	return check(Object.entries(expected).every(([id, f]) => firsts[id] === f), { firsts, expected });
 });
 
 const passed = results.filter((r) => r.ok).length;

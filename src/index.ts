@@ -148,7 +148,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 	// How long to wait for a cooling rung instead of failing: background work waits up to
 	// background.maxWaitSeconds, a foreground request up to cooldowns.waitSeconds.
-	const waitFor = (candidates: readonly Candidate[], result: PickResult, nowMs: number): { key: string; atMs: number } | undefined => {
+	const waitFor = (candidates: readonly Candidate[], result: PickResult, nowMs: number, sinceMs: number): { key: string; atMs: number } | undefined => {
 		const cooling = new Set(result.skipped.filter((s) => s.reason === "cooling").map((s) => s.key));
 		let best: { key: string; atMs: number } | undefined;
 		for (const c of candidates) {
@@ -158,7 +158,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			if (!best || atMs < best.atMs) best = { key, atMs };
 		}
 		const limitMs = (isBackground() ? cfg.background.maxWaitSeconds : cfg.cooldowns.waitSeconds) * 1000;
-		return best && best.atMs - nowMs <= limitMs ? best : undefined;
+		return best && best.atMs - sinceMs <= limitMs ? best : undefined;
 	};
 
 	const noteFailure = (
@@ -223,9 +223,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 
 		const rule = ruleFor(ctx.cwd);
-		let candidates = candidatesFor(cfg, tier, rule, expansion(ctx));
+		const expand = expansion(ctx);
+		let candidates = candidatesFor(cfg, tier, rule, expand);
 		const override = state.override;
-		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider))) {
+		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
 		// Stay on the model that last served this session and tier until it cools, fails, or cannot fit
@@ -235,7 +236,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const tokens = requestTokens(req.messages);
 		lastTokens = tokens;
 		let result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
-		for (let wait = waitFor(candidates, result, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now())) {
+		for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
 			const until = new Date(wait.atMs);
 			if (req.reason !== "direct")
 				publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → waiting for ${wait.key} until ${until.toLocaleTimeString()}`);
@@ -352,7 +353,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const candidates = candidatesFor(cfg, lastTier, rule, expansion(ctx));
 		const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs) });
 		const next = result.chosen ? candidateKey(result.chosen) : undefined;
-		const wait = result.chosen ? undefined : waitFor(candidates, result, nowMs);
+		const wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
 		if (!next && !wait) return;
 		continues++;
 		const where = next ? `on ${next}` : `on ${wait!.key} when it is free at ${new Date(wait!.atMs).toLocaleTimeString()}`;

@@ -48,7 +48,7 @@ See [`examples/tiers.json`](examples/tiers.json).
 3. The chain for the tier comes from the first matching rule, otherwise the base config.
 4. Candidates are skipped when the model is unknown, has no credentials, is cooling down, or cannot fit the conversation. If every usable candidate is only too small, the one with the largest context window is used and Pi compacts the conversation before sending, instead of the request failing.
 5. Retries after a failure first record the cooldown. A timeout or dropped connection records none, so the retry stays on the same model. Failures Pi does not retry (usage limits, exhausted retries, including timeouts) are cooled down too, and the turn continues on the next usable model with a visible note.
-6. When no candidate is usable but one is only cooling down, a background request waits for it up to `background.maxWaitSeconds`, and a foreground request up to `cooldowns.waitSeconds`. The status line shows what it waits for. Otherwise the request fails with the reasons.
+6. When no candidate is usable but one is only cooling down, a background request waits for it up to `background.maxWaitSeconds` in total, and a foreground request up to `cooldowns.waitSeconds` in total. The status line shows what it waits for. Otherwise the request fails with the reasons.
 
 Direct requests (compaction summaries and extension calls through the model registry) are routed the same way, but Pi does not report their failures to extensions, so they benefit only from cooldowns recorded by agent-loop requests, in this or any other Pi process.
 
