@@ -364,7 +364,10 @@ scenario("with spread on, sessions start on different accounts of a group", () =
 	const firsts = Object.fromEntries(
 		Object.keys(expected).map((id) => [id, answered(runPi(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] }))]),
 	);
-	return check(Object.entries(expected).every(([id, f]) => firsts[id] === f), { firsts, expected });
+	return check(
+		Object.entries(expected).every(([id, f]) => firsts[id] === f),
+		{ firsts, expected },
+	);
 });
 
 const passed = results.filter((r) => r.ok).length;
