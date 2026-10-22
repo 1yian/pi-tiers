@@ -46,6 +46,16 @@ export interface Cooldowns {
 	serverErrorSeconds: number;
 	usageLimitSeconds: number;
 	authSeconds: number;
+	/** A foreground request waits this long at most for a cooling rung instead of failing. */
+	waitSeconds: number;
+}
+
+/** Background work: every request from a process started with PI_TIERS_BACKGROUND=1. */
+export interface Background {
+	/** Providers background work never uses, such as an account kept for the user. */
+	skip: Set<string>;
+	/** How long background work waits for a cooling rung instead of failing or falling further. */
+	maxWaitSeconds: number;
 }
 
 export interface Config {
@@ -56,6 +66,9 @@ export interface Config {
 	rules: Rule[];
 	override?: RegExp;
 	cooldowns: Cooldowns;
+	background: Background;
+	/** Start each session on a different member of an account group, chosen from its session id. */
+	spread: boolean;
 	warnProviders: Set<string>;
 	stateDir: string;
 }
@@ -165,7 +178,15 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		serverErrorSeconds: num(c.serverErrorSeconds, "cooldowns.serverErrorSeconds", 30),
 		usageLimitSeconds: num(c.usageLimitSeconds, "cooldowns.usageLimitSeconds", 3600),
 		authSeconds: num(c.authSeconds, "cooldowns.authSeconds", 3600),
+		waitSeconds: num(c.waitSeconds, "cooldowns.waitSeconds", 0),
 	};
+
+	const b = obj(root.background ?? {}, "background");
+	const background: Background = {
+		skip: new Set(b.skip === undefined ? [] : strArray(b.skip, "background.skip")),
+		maxWaitSeconds: num(b.maxWaitSeconds, "background.maxWaitSeconds", 6 * 3600),
+	};
+	if (root.spread !== undefined && typeof root.spread !== "boolean") fail("spread", "expected true or false");
 
 	return {
 		path,
@@ -175,6 +196,8 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		rules,
 		override: root.override === undefined ? undefined : regex(str(root.override, "override"), "override", fail),
 		cooldowns,
+		background,
+		spread: root.spread === true,
 		warnProviders: new Set(root.warnProviders === undefined ? [] : strArray(root.warnProviders, "warnProviders")),
 		stateDir: root.stateDir === undefined ? join(agentDir, "tiers") : expandHome(str(root.stateDir, "stateDir")),
 	};

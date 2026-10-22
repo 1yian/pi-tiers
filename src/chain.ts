@@ -12,22 +12,38 @@ export interface Candidate {
 
 export const candidateKey = (c: { provider: string; model: string }) => `${c.provider}/${c.model}`;
 
+export interface Expansion {
+	/** Rotates every account group by this many members, so sessions start on different accounts. */
+	rotate?: number;
+	/** Providers left out entirely, such as an account kept away from background work. */
+	skip?: ReadonlySet<string>;
+}
+
 /**
  * Candidates for a tier in this context: the rule's replacement chain when it has one, otherwise
- * the base chain filtered to the rule's allowed providers. Account groups expand in order.
+ * the base chain filtered to the rule's allowed providers. Account groups expand in order, rotated
+ * by `rotate`.
  */
-export function candidatesFor(config: Config, tier: string, rule: Rule | undefined): Candidate[] {
+export function candidatesFor(config: Config, tier: string, rule: Rule | undefined, { rotate = 0, skip }: Expansion = {}): Candidate[] {
 	const replacement = rule?.tiers.get(tier);
 	const chain: ChainEntry[] = replacement ?? config.tiers.get(tier)?.chain ?? [];
 	const allow = replacement ? undefined : rule?.allowProviders;
 	const out: Candidate[] = [];
 	for (const entry of chain) {
-		for (const provider of config.accounts.get(entry.provider) ?? [entry.provider]) {
+		const group = config.accounts.get(entry.provider);
+		const members = group ? rotated(group, rotate) : [entry.provider];
+		for (const provider of members) {
 			if (allow && !allow.has(provider)) continue;
+			if (skip?.has(provider)) continue;
 			out.push({ provider, model: entry.model, thinking: entry.thinking, position: out.length + 1 });
 		}
 	}
 	return out;
+}
+
+function rotated<T>(list: readonly T[], by: number): T[] {
+	const start = ((by % list.length) + list.length) % list.length;
+	return [...list.slice(start), ...list.slice(0, start)];
 }
 
 export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "context-too-small";

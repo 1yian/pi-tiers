@@ -6,6 +6,7 @@
 //   500     retryable server error
 //   401     authentication failure
 //   403     model refused for this account (not an auth failure)
+//   timeout the request times out without an HTTP response (Pi retries it)
 // The classifier answers with $FAKE_CLASSIFY ({"choice","confidence"} or {"error": "..."}).
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Model, SimpleStreamOptions } from "@earendil-works/pi-ai";
@@ -61,6 +62,13 @@ function stream(model: Model<Api>, context: unknown, options?: SimpleStreamOptio
 			timestamp: Date.now(),
 		};
 		const outcome = nextOutcome(key);
+		if (outcome === "timeout") {
+			message.stopReason = "error";
+			message.errorMessage = "Request timed out.";
+			out.push({ type: "error", reason: "error", error: message });
+			out.end();
+			return;
+		}
 		const error = ERRORS[outcome];
 		await options?.onResponse?.({ status: error?.status ?? 200, headers: error?.headers ?? {} }, model);
 		if (error) {

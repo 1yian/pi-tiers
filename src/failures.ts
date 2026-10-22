@@ -24,6 +24,17 @@ const RATE = /\b429\b|rate.?limit|too many requests|resource.?exhausted/i;
 const SERVER =
 	/overloaded|\b5\d\d\b|server.?error|internal.?error|unavailable|at capacity|timed? ?out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|network/i;
 
+const NETWORK = /timed? ?out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|connection error|network/i;
+
+/**
+ * A request that never got an HTTP error back: a timeout or a dropped connection. It says nothing about
+ * the account, so a retry stays on the same model, where its prompt cache is warm.
+ */
+export function isTransient(errorMessage: string, response: ResponseInfo | undefined): boolean {
+	const status = response?.status ?? 0;
+	return (status === 0 || status < 400) && NETWORK.test(errorMessage) && !USAGE.test(errorMessage) && !RATE.test(errorMessage);
+}
+
 const MIN_MS = 10_000;
 const MAX_MS = 8 * 24 * 3600_000;
 

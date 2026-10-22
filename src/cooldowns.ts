@@ -38,6 +38,11 @@ export class CooldownStore {
 		return entry && entry.untilMs > nowMs ? entry : undefined;
 	}
 
+	/** When every one of these keys is free again, or nowMs when none is cooling. */
+	freeAt(keys: readonly string[], nowMs: number): number {
+		return Math.max(nowMs, ...keys.map((key) => this.get(key, nowMs)?.untilMs ?? nowMs));
+	}
+
 	active(nowMs: number): Array<[string, CooldownEntry]> {
 		this.refresh(nowMs);
 		return [...this.merged].filter(([, e]) => e.untilMs > nowMs).sort(([a], [b]) => a.localeCompare(b));
