@@ -44,7 +44,8 @@ export function classifyFailure(errorMessage: string, response: ResponseInfo | u
 	if (status === 401 || AUTH.test(errorMessage)) return { kind: "auth", scope: "account", untilMs: until(cooldowns.authSeconds) };
 	if (status === 403 || FORBIDDEN.test(errorMessage)) return { kind: "forbidden", scope: "model", untilMs: until(cooldowns.authSeconds) };
 	if (status === 429 || RATE.test(errorMessage)) return { kind: "rate-limit", scope: "model", untilMs: until(cooldowns.rateLimitSeconds) };
-	if (status >= 500 || SERVER.test(errorMessage) || NETWORK.test(errorMessage)) return { kind: "server", scope: "model", untilMs: clamp(nowMs + cooldowns.serverErrorSeconds * 1000, nowMs) };
+	if (status >= 500 || SERVER.test(errorMessage) || NETWORK.test(errorMessage))
+		return { kind: "server", scope: "model", untilMs: clamp(nowMs + cooldowns.serverErrorSeconds * 1000, nowMs) };
 	return undefined;
 }
 

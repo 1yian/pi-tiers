@@ -301,7 +301,11 @@ scenario("a timeout is retried on the same account, where the prompt cache is, i
 });
 
 scenario("a dropped connection moves on to the next account once Pi's retries run out", () => {
-	const r = runPi(makeHome("connection"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] } });
+	const r = runPi(makeHome("connection"), {
+		model: "tier/default",
+		prompt: "hello",
+		plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] },
+	});
 	const ok =
 		answered(r) === "fake-b/m1" &&
 		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-b/m1:ok" &&
