@@ -5,10 +5,10 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 - **Failover across accounts and models.** A rate limit, usage limit, auth failure (401), refusal of one model (403), or server error in a conversation turn cools that account (or that model on it) down, and the request moves to the next usable rung.
 - **Cooldowns are shared** by every Pi process on the machine, so one crewmate hitting a limit spares the others the wasted request.
 - **`tier/auto`** classifies the first message of a session with a classifier model (for example TypeSafe's Jev) and stays on that tier for the session.
-- **Sticky within a turn, fail back between turns.** Tool follow-ups stay on the model that answered, keeping prompt caches warm; the next user message returns to the most preferred usable model.
+- **Sticky per session and tier.** Once a model answers, the session keeps using it for that tier, including follow-ups, new messages, and direct requests such as compaction, keeping prompt caches warm. It leaves only when that model fails, cools down, or cannot fit the conversation, and then takes the next usable rung in chain order. A higher-priority rung whose cooldown ended does not pull the session back. Direct requests report no failures, so a failing sticky model for them clears only when an agent-loop request cools it.
 - **Rules** replace or filter chains by git remote or working directory, for example "work repos only use the work account".
 - **Forced rules.** `PI_TIERS_RULE=<name>` applies that rule wherever Pi runs, for example a `vertex-pi` wrapper that keeps a session on one cloud. An unknown name fails closed.
-- **Context-aware.** A model whose context window cannot hold the conversation is skipped instead of forcing a compaction.
+- **Context-aware.** A model whose context window cannot hold the conversation is skipped instead of forcing a compaction. The request is sized from the last real response's reported usage plus the messages after it, not from Pi's whole-session estimate, so an edited context cannot make a healthy account look too small.
 
 ## Install
 
