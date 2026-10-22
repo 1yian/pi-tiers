@@ -14,10 +14,10 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AutoDecision, decideTier, lastUserText, messageText } from "./auto.ts";
-import { type Candidate, candidateKey, candidatesFor, pick, type SkipReason } from "./chain.ts";
+import { type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason } from "./chain.ts";
 import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THINKING_LEVELS, type Thinking } from "./config.ts";
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
-import { classifyFailure, type Failure, type ResponseInfo } from "./failures.ts";
+import { classifyFailure, type Failure, isTransient, type ResponseInfo } from "./failures.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -137,10 +137,44 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
 
-	const noteFailure = (provider: string, model: string, errorMessage: string, ctx: ExtensionContext): Failure | undefined => {
+	const isBackground = () => process.env.PI_TIERS_BACKGROUND === "1";
+
+	// Background work leaves out the providers kept for the user; with `spread`, each session starts on
+	// its own member of every account group, so one account's limit moves only the sessions it served.
+	const expansion = (ctx: ExtensionContext): Expansion => ({
+		rotate: cfg.spread ? seedOf(ctx.sessionManager.getSessionId()) : 0,
+		skip: isBackground() ? cfg.background.skip : undefined,
+	});
+
+	// How long to wait for a cooling rung instead of failing: background work waits up to
+	// background.maxWaitSeconds, a foreground request up to cooldowns.waitSeconds.
+	const waitFor = (candidates: readonly Candidate[], result: PickResult, nowMs: number, sinceMs: number): { key: string; atMs: number } | undefined => {
+		const cooling = new Set(result.skipped.filter((s) => s.reason === "cooling").map((s) => s.key));
+		let best: { key: string; atMs: number } | undefined;
+		for (const c of candidates) {
+			const key = candidateKey(c);
+			if (!cooling.has(key)) continue;
+			const atMs = store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs);
+			if (!best || atMs < best.atMs) best = { key, atMs };
+		}
+		const limitMs = (isBackground() ? cfg.background.maxWaitSeconds : cfg.cooldowns.waitSeconds) * 1000;
+		return best && best.atMs - sinceMs <= limitMs ? best : undefined;
+	};
+
+	const noteFailure = (
+		provider: string,
+		model: string,
+		errorMessage: string,
+		ctx: ExtensionContext,
+		{ transientCools }: { transientCools: boolean },
+	): Failure | undefined => {
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
 		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
+		if (!transientCools && isTransient(errorMessage, response)) {
+			log({ event: "transient", key, error: errorMessage.slice(0, 300) });
+			return undefined;
+		}
 		const failure = classifyFailure(errorMessage, response, cfg.cooldowns, nowMs);
 		if (!failure) return undefined;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
@@ -161,7 +195,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const previous = req.state ?? {};
 		const state: TierState = { ...previous };
 
-		if (req.reason === "retry" && req.failed) noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx);
+		// A timeout or dropped connection is retried on the same model; only Pi's last retry moves on.
+		if (req.reason === "retry" && req.failed)
+			noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx, { transientCools: false });
 
 		let tier = selected;
 		if (selected === AUTO) {
@@ -187,9 +223,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 
 		const rule = ruleFor(ctx.cwd);
-		let candidates = candidatesFor(cfg, tier, rule);
+		const expand = expansion(ctx);
+		let candidates = candidatesFor(cfg, tier, rule, expand);
 		const override = state.override;
-		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider))) {
+		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
 		// Stay on the model that last served this session and tier until it cools, fails, or cannot fit
@@ -198,7 +235,15 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const sticky = state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined);
 		const tokens = requestTokens(req.messages);
 		lastTokens = tokens;
-		const result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
+		let result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
+		for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
+			const until = new Date(wait.atMs);
+			if (req.reason !== "direct")
+				publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → waiting for ${wait.key} until ${until.toLocaleTimeString()}`);
+			log({ event: "wait", selected, tier, reason: req.reason, key: wait.key, until: until.toISOString(), background: isBackground() });
+			await sleep(wait.atMs - Date.now() + 1000, req.signal);
+			result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, Date.now()), contextWindow: windowOf(ctx) });
+		}
 
 		if (!result.chosen) {
 			const why = result.skipped.map((s) => `${s.key}: ${s.reason}`).join(", ") || "empty chain";
@@ -301,19 +346,23 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted || continues >= MAX_CONTINUES) return;
-		const failure = noteFailure(failed.provider, failed.model, failed.errorMessage ?? "", ctx);
+		const failure = noteFailure(failed.provider, failed.model, failed.errorMessage ?? "", ctx, { transientCools: true });
 		if (!failure || !lastTier) return;
 		const nowMs = Date.now();
 		const rule = ruleFor(ctx.cwd);
-		const next = pick({ candidates: candidatesFor(cfg, lastTier, rule), check: checker(ctx, lastTokens, nowMs) }).chosen;
-		if (!next) return;
+		const candidates = candidatesFor(cfg, lastTier, rule, expansion(ctx));
+		const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs) });
+		const next = result.chosen ? candidateKey(result.chosen) : undefined;
+		const wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
+		if (!next && !wait) return;
 		continues++;
+		const where = next ? `on ${next}` : `on ${wait!.key} when it is free at ${new Date(wait!.atMs).toLocaleTimeString()}`;
 		return {
 			entries: [
 				{
 					type: "custom_message" as const,
 					customType: ENTRY,
-					content: `pi-tiers: ${failed.provider}/${failed.model} failed (${failure.kind}); continuing the interrupted turn on ${candidateKey(next)}.`,
+					content: `pi-tiers: ${failed.provider}/${failed.model} failed (${failure.kind}); continuing the interrupted turn ${where}.`,
 					display: true,
 				},
 			],
@@ -351,7 +400,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const check = checker(ctx, 0, nowMs);
 			const lines = [`pi-tiers (${cfg.path})${rule ? `, rule: ${rule.name}` : ""}`];
 			for (const name of cfg.tiers.keys()) {
-				const parts = candidatesFor(cfg, name, rule).map((c) => {
+				const parts = candidatesFor(cfg, name, rule, expansion(ctx)).map((c) => {
 					const reason = check(c);
 					return `${candidateKey(c)}:${c.thinking}${reason ? ` [${reason}]` : ""}`;
 				});
@@ -399,4 +448,26 @@ function requestTokens(messages: readonly Message[]): number {
 	}
 	for (const m of messages.slice(start)) tokens += estimateMessageTokens(m);
 	return tokens;
+}
+
+/** A stable number per session, so a session keeps its starting account across processes and restarts. */
+function seedOf(sessionId: string): number {
+	let hash = 2166136261;
+	for (let i = 0; i < sessionId.length; i++) hash = Math.imul(hash ^ sessionId.charCodeAt(i), 16777619);
+	return hash >>> 0;
+}
+
+function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
+	return new Promise((resolve, reject) => {
+		if (signal?.aborted) return reject(new Error("pi-tiers: wait aborted"));
+		const timer = setTimeout(resolve, Math.max(0, ms));
+		signal?.addEventListener(
+			"abort",
+			() => {
+				clearTimeout(timer);
+				reject(new Error("pi-tiers: wait aborted"));
+			},
+			{ once: true },
+		);
+	});
 }

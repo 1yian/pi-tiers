@@ -282,6 +282,107 @@ scenario("the same small-window model is used when the conversation fits", () =>
 	return check(answered(r) === "fake-small/tiny", r);
 });
 
+function withTiers(home, change) {
+	const tiers = JSON.parse(readFileSync(join(home, "tiers.json"), "utf8"));
+	change(tiers);
+	writeFileSync(join(home, "tiers.json"), JSON.stringify(tiers));
+	return home;
+}
+
+/** Cools a key as another Pi process would, for the given number of milliseconds from now. */
+function coolFromOtherProcess(home, key, ms) {
+	mkdirSync(join(home, "tiers/cooldowns"), { recursive: true });
+	writeFileSync(join(home, "tiers/cooldowns/999999.json"), JSON.stringify({ [key]: { untilMs: Date.now() + ms, reason: "usage-limit" } }));
+}
+
+scenario("a timeout is retried on the same account, where the prompt cache is, instead of moving to the next one", () => {
+	const r = runPi(makeHome("timeout"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["timeout"] } });
+	return check(answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:timeout,fake-a/m1:ok" && r.cooldowns.length === 0, r);
+});
+
+scenario("a dropped connection moves on to the next account once Pi's retries run out", () => {
+	const r = runPi(makeHome("connection"), {
+		model: "tier/default",
+		prompt: "hello",
+		plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] },
+	});
+	const ok =
+		answered(r) === "fake-b/m1" &&
+		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-b/m1:ok" &&
+		r.cooldowns.includes("model:fake-a/m1");
+	return check(ok, r);
+});
+
+scenario("background work never uses an account kept for the user", () => {
+	const home = withTiers(makeHome("background-skip"), (t) => {
+		t.background = { skip: ["fake-a"] };
+	});
+	const background = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
+	const overridden = runPi(home, { model: "tier/default", prompt: "Model override: fake-a/m1\nhello", env: { PI_TIERS_BACKGROUND: "1" } });
+	const foreground = runPi(home, { model: "tier/default", prompt: "hello" });
+	const ok =
+		answered(background) === "fake-b/m1" &&
+		background.calls.join() === "fake-b/m1:ok" &&
+		answered(overridden) === "fake-b/m1" &&
+		overridden.calls.join() === "fake-b/m1:ok" &&
+		answered(foreground) === "fake-a/m1";
+	return check(ok, { background, overridden, foreground });
+});
+
+scenario("background work waits for a cooling account instead of failing or falling to the next rung", () => {
+	const home = withTiers(makeHome("background-wait"), (t) => {
+		t.tiers.default.chain = ["fake-c/m1:low", "fake-small/tiny:low"];
+		t.background = { skip: ["fake-small"] };
+	});
+	coolFromOtherProcess(home, "account:fake-c", 3000);
+	const started = Date.now();
+	const r = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
+	r.waitedMs = Date.now() - started;
+	const waited = readFileSync(join(home, "tiers/log.jsonl"), "utf8").includes('"event":"wait"');
+	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok" && waited && r.waitedMs >= 3000, r);
+});
+
+scenario("a foreground request waits up to cooldowns.waitSeconds for a rung that frees up soon", () => {
+	const home = withTiers(makeHome("foreground-wait"), (t) => {
+		t.tiers.default.chain = ["fake-c/m1:low"];
+		t.cooldowns.waitSeconds = 30;
+	});
+	coolFromOtherProcess(home, "account:fake-c", 3000);
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok", r);
+});
+
+scenario("a foreground request still fails at once when the rung frees up later than cooldowns.waitSeconds", () => {
+	const home = withTiers(makeHome("foreground-no-wait"), (t) => {
+		t.tiers.default.chain = ["fake-c/m1:low"];
+		t.cooldowns.waitSeconds = 1;
+	});
+	coolFromOtherProcess(home, "account:fake-c", 60_000);
+	const started = Date.now();
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	r.tookMs = Date.now() - started;
+	return check(r.final?.stopReason === "error" && r.calls.length === 0 && r.tookMs < 30_000, r);
+});
+
+scenario("with spread on, sessions start on different accounts of a group", () => {
+	const home = withTiers(makeHome("spread"), (t) => {
+		t.spread = true;
+	});
+	const expected = {
+		"00000000-0000-4000-8000-000000000001": "fake-a/m1",
+		"00000000-0000-4000-8000-000000000002": "fake-b/m1",
+		"00000000-0000-4000-8000-000000000003": "fake-a/m1",
+		"00000000-0000-4000-8000-000000000004": "fake-b/m1",
+	};
+	const firsts = Object.fromEntries(
+		Object.keys(expected).map((id) => [id, answered(runPi(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] }))]),
+	);
+	return check(
+		Object.entries(expected).every(([id, f]) => firsts[id] === f),
+		{ firsts, expected },
+	);
+});
+
 const passed = results.filter((r) => r.ok).length;
 const report = [
 	`# pi-tiers end-to-end run`,
