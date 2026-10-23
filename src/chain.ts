@@ -48,6 +48,11 @@ function rotated<T>(list: readonly T[], by: number): T[] {
 	return [...list.slice(start), ...list.slice(0, start)];
 }
 
+/** Subscription candidates first, then pay-per-token ones, each keeping chain order. */
+export function subscriptionsFirst<T extends { provider: string }>(candidates: readonly T[], payg: ReadonlySet<string>): T[] {
+	return [...candidates.filter((c) => !payg.has(c.provider)), ...candidates.filter((c) => payg.has(c.provider))];
+}
+
 export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "quota-low" | "context-too-small";
 
 export interface PickInput {
@@ -102,6 +107,8 @@ export interface AssignInput {
 	load?: (c: Candidate) => number;
 	/** Breaks exact ties differently per session, so sessions starting together spread out. */
 	seed?: number;
+	/** Pay-per-token providers: chosen only when no subscription candidate is usable, and last among cooling ones. */
+	payg?: ReadonlySet<string>;
 }
 
 /** Rooms within this many points of each other count as equal, so load decides between near-equal accounts. */
@@ -113,7 +120,7 @@ export const ROOM_BAND = 10;
  * is evidence the account is exhausted, so it ranks a candidate last but never removes it, because
  * a stale or wrong cooldown must not leave the session without a model.
  */
-export function assign({ candidates, check, score, freeAt, contextWindow, room, load, seed }: AssignInput): PickResult {
+export function assign({ candidates, check, score, freeAt, contextWindow, room, load, seed, payg }: AssignInput): PickResult {
 	const skipped: PickResult["skipped"] = [];
 	const ready: Candidate[] = [];
 	const cooling: Candidate[] = [];
@@ -128,9 +135,12 @@ export function assign({ candidates, check, score, freeAt, contextWindow, room, 
 		}
 	}
 	const byOrder = (a: Candidate, b: Candidate) => (a.group ?? 0) - (b.group ?? 0) || a.position - b.position;
-	if (ready.length) {
-		const first = Math.min(...ready.map((c) => c.group ?? 0));
-		const group = ready.filter((c) => (c.group ?? 0) === first);
+	const isPayg = (c: Candidate) => Boolean(payg?.has(c.provider));
+	const subscriptions = ready.filter((c) => !isPayg(c));
+	const usable = subscriptions.length ? subscriptions : ready;
+	if (usable.length) {
+		const first = Math.min(...usable.map((c) => c.group ?? 0));
+		const group = usable.filter((c) => (c.group ?? 0) === first);
 		// With a live reading for every account of the group, the most room left wins, then the least load;
 		// otherwise the header-based score decides as before.
 		const rooms = room && load ? group.map((c) => room(c)) : [];
@@ -143,7 +153,7 @@ export function assign({ candidates, check, score, freeAt, contextWindow, room, 
 		return { chosen: group.sort((a, b) => score(a) - score(b) || a.position - b.position)[0], skipped };
 	}
 	if (cooling.length) {
-		const best = [...cooling].sort((a, b) => freeAt(a) - freeAt(b) || byOrder(a, b))[0];
+		const best = [...cooling].sort((a, b) => Number(isPayg(a)) - Number(isPayg(b)) || freeAt(a) - freeAt(b) || byOrder(a, b))[0];
 		return { chosen: best, skipped };
 	}
 	if (tooSmall.length) {

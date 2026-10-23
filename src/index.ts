@@ -15,12 +15,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AutoDecision, decideTier, lastUserText, messageText } from "./auto.ts";
-import { assign, type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason } from "./chain.ts";
+import { assign, type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason, subscriptionsFirst } from "./chain.ts";
 import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THINKING_LEVELS, type Thinking } from "./config.ts";
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
 import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
-import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, type Outcome, QuotaStore, roomFor } from "./quota.ts";
+import { askProvider, tableRow } from "./provider-pick.ts";
+import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, type Outcome, type QuotaReading, QuotaStore, roomFor } from "./quota.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -90,7 +91,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 	let lastTier: string | undefined;
 	let lastAssistant: AssistantMessage | undefined;
 	/** Set when the last failed turn was rewritten to the quota line; keeps the provider's own error for cooldowns and the failure log. */
-	let exhausted: { line: string; original: string } | undefined;
+	let exhausted: { line: string; original: string; mark?: { key: string; untilMs: number } } | undefined;
 	// Size of the most recent request, for choosing a model to continue a failed run on.
 	let lastTokens = 0;
 	let continues = 0;
@@ -165,6 +166,27 @@ export default function piTiers(pi: ExtensionAPI): void {
 	const quotaLine = (outcomes: ReadonlyMap<string, Outcome>) =>
 		[...outcomes].map(([provider, o]) => `${provider} ${"reading" in o ? `${describeQuota(o.reading)} (${o.source})` : `unavailable: ${o.error}`}`).join("; ");
 
+	// A live reading is authoritative for providers that have a reader. When it shows room again, a usage-limit
+	// mark on the account is stale (a banked reset restores quota before the mark's own reset time), so it is cleared.
+	const clearStaleMarks = (outcomes: ReadonlyMap<string, Outcome>, nowMs: number) => {
+		if (!cfg.quota) return;
+		for (const [provider, o] of outcomes) {
+			if (!("reading" in o)) continue;
+			const mark = store.get(accountKey(provider), nowMs);
+			if (mark?.reason !== "usage-limit" || (mark.atMs ?? 0) > o.reading.atMs) continue;
+			const room = accountRoom(o.reading);
+			if (room === undefined || room < cfg.quota.minRemainingPercent) continue;
+			store.clear(accountKey(provider), o.reading.atMs);
+			log({ event: "cooldown-cleared", key: accountKey(provider), reason: mark.reason, room: Math.round(room), source: o.source });
+		}
+	};
+	const readQuota = async (providers: Iterable<string>, ctx: ExtensionContext, nowMs: number) => {
+		if (!quota) return new Map<string, Outcome>();
+		const outcomes = await quota.read(providers, (p) => ctx.modelRegistry.getApiKeyForProvider(p));
+		clearStaleMarks(outcomes, nowMs);
+		return outcomes;
+	};
+
 	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
 
 	const isBackground = () => process.env.PI_TIERS_BACKGROUND === "1";
@@ -216,7 +238,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const failure = classifyFailure(errorMessage, response, cfg.cooldowns, nowMs);
 		if (!failure) return undefined;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
-		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind });
+		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs });
 		log({ event: "failure", key, kind: failure.kind, scope: failure.scope, until: new Date(failure.untilMs).toISOString(), error: errorMessage.slice(0, 300) });
 		if (failure.kind === "auth" && notify)
 			ctx.ui.notify(`pi-tiers: ${provider} rejected its credentials; skipping it until ${new Date(failure.untilMs).toLocaleTimeString()}`, "warning");
@@ -309,7 +331,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 		const rule = ruleFor(ctx.cwd);
 		const expand = expansion(ctx);
-		let candidates = candidatesFor(cfg, tier, rule, expand);
+		let candidates = subscriptionsFirst(candidatesFor(cfg, tier, rule, expand), cfg.payg);
 		if (!candidates.length && avoided().size && candidatesFor(cfg, tier, rule, { ...expand, skip: undefined }).length) {
 			throw new Error(`pi-tiers: PI_TIERS_AVOID (${[...avoided()].join(",")}) leaves no provider for tier '${tier}'.`);
 		}
@@ -330,16 +352,17 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const tokens = requestTokens(req.messages);
 		lastTokens = tokens;
 		const resilient = cfg.resilient.has(tier);
-		const check = (at: number) => checker(ctx, tokens, at);
+		// Resilient tiers consult live quota too (the shared cache keeps this to one read per account a minute).
+		const check = (at: number) => checker(ctx, tokens, at, resilient);
 		let quotaOutcomes: ReadonlyMap<string, Outcome> = new Map();
 		const selectNew = async (): Promise<PickResult> => {
-			// Live quota is read once here, when a session picks its account; a failed or slow reading leaves the
+			// Live quota is read when a session picks its account; a failed or slow reading leaves the
 			// header-based score in charge and never delays the start by more than quota.timeoutSeconds.
-			if (quota)
-				quotaOutcomes = await quota.read(
-					candidates.map((c) => c.provider),
-					(p) => ctx.modelRegistry.getApiKeyForProvider(p),
-				);
+			quotaOutcomes = await readQuota(
+				candidates.map((c) => c.provider),
+				ctx,
+				nowMs,
+			);
 			const roomOf = (c: Candidate) => {
 				const reading = quota?.latest.get(c.provider);
 				return reading && roomFor(reading, c.model);
@@ -348,8 +371,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 				const l = load.of(c.provider, nowMs, sessionId);
 				return l.agents + l.tokens / TOKENS_PER_AGENT;
 			};
-			return assign({
+			const scored = assign({
 				candidates,
+				payg: cfg.payg,
 				check: checker(ctx, tokens, nowMs, true),
 				score: (c) => {
 					const l = load.of(c.provider, nowMs, sessionId);
@@ -365,10 +389,38 @@ export default function piTiers(pi: ExtensionAPI): void {
 				load: loadOf,
 				seed: seedOf(sessionId),
 			});
+			if (resilient || req.reason === "direct" || candidates[0]?.position === 0) return scored;
+			// The tier is known; now the classifier chooses the provider from the tier's own usable candidates,
+			// subscriptions first. Code validates the answer and falls back to the ranked pick above.
+			const usable = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
+			// Every usable provider is offered, pay-per-token ones labelled as such; the classifier is told to prefer subscriptions.
+			const offered = usable;
+			if (!offered.length) return scored;
+			const rows = offered.map((c) => tableRow(c, quota?.latest.get(c.provider), load.of(c.provider, nowMs, sessionId), nowMs, cfg.payg.has(c.provider)));
+			const pick: { key?: string; fallback?: string; detail?: string } =
+				offered.length > 1 && cfg.auto
+					? await askProvider(cfg.auto, { name: tier, description: cfg.tiers.get(tier)?.description ?? "" }, lastUserText(req.messages), rows, ctx, req.signal)
+					: { fallback: offered.length > 1 ? "no-classifier" : "single" };
+			const chosen = pick.key ? offered.find((c) => candidateKey(c) === pick.key) : undefined;
+			const record = {
+				table: rows,
+				answer: pick.key ?? null,
+				source: chosen ? "jev" : "code",
+				...(pick.fallback ? { fallback: pick.fallback } : {}),
+				...(pick.detail ? { detail: pick.detail } : {}),
+				chosen: candidateKey(chosen ?? scored.chosen ?? offered[0]),
+			};
+			log({ event: "provider-pick", session: sessionId, tier, ...record });
+			return chosen ? { chosen, skipped: scored.skipped } : scored;
 		};
 		let result: PickResult;
 		let lastResort = false;
 		if (resilient) {
+			await readQuota(
+				candidates.map((c) => c.provider),
+				ctx,
+				nowMs,
+			);
 			result = pick({ candidates, prefer: sticky, check: check(nowMs), contextWindow: windowOf(ctx) });
 			for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
 				const until = new Date(wait.atMs);
@@ -476,7 +528,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (!failure) return;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
 		if ((store.get(storeKey, nowMs)?.untilMs ?? 0) >= failure.untilMs) return;
-		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind });
+		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs });
 		log({
 			event: "failure",
 			source: "response",
@@ -497,12 +549,21 @@ export default function piTiers(pi: ExtensionAPI): void {
 	// When a turn on a tier fails and the failed account's live quota is used up, the turn's visible error becomes one
 	// line naming the provider and window, so whoever reads the session's error (Fleet's runtime-failure report) gets
 	// exactly that. Any other failure is left as it is.
-	const exhaustedLine = async (failed: AssistantMessage, ctx: ExtensionContext): Promise<string | undefined> => {
+	const exhaustedLine = async (
+		failed: AssistantMessage,
+		ctx: ExtensionContext,
+	): Promise<{ line: string; mark?: { key: string; untilMs: number } } | undefined> => {
 		if (!quota || !cfg.quota || ctx.model?.provider !== PROVIDER) return undefined;
 		const outcome = (await quota.read([failed.provider], (p) => ctx.modelRegistry.getApiKeyForProvider(p), Date.now(), true)).get(failed.provider);
 		if (!outcome || !("reading" in outcome)) return undefined;
 		const window = exhaustedWindow(outcome.reading, failed.model, cfg.quota.minRemainingPercent);
-		return window ? `${failed.provider} ${window.label} quota has exhausted. Restart worker to launch on a new provider.` : undefined;
+		if (!window) return undefined;
+		// The live reset time is authoritative: the account (or, for a model-scoped window, that model) is out until then.
+		const key = window.scope ? modelKey(failed.provider, failed.model) : accountKey(failed.provider);
+		return {
+			line: `${failed.provider} ${window.label} quota has exhausted. Restart worker to launch on a new provider.`,
+			mark: window.resetAtMs ? { key, untilMs: window.resetAtMs } : undefined,
+		};
 	};
 
 	pi.on("message_end", async (event, ctx) => {
@@ -513,9 +574,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });
 		if (lastAssistant.stopReason === "error") {
-			const line = await exhaustedLine(lastAssistant, ctx);
-			if (line) {
-				exhausted = { line, original: lastAssistant.errorMessage ?? "" };
+			const found = await exhaustedLine(lastAssistant, ctx);
+			if (found) {
+				const { line, mark } = found;
+				exhausted = { line, original: lastAssistant.errorMessage ?? "", mark };
 				log({ event: "quota-exhausted", key: `${lastAssistant.provider}/${lastAssistant.model}`, line });
 				lastAssistant = { ...lastAssistant, errorMessage: line };
 				return { message: lastAssistant };
@@ -534,13 +596,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted) return;
 		const failure = noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { transientCools: true, notify: pool });
+		if (exhausted?.mark) {
+			const nowMs = Date.now();
+			store.set(exhausted.mark.key, { untilMs: exhausted.mark.untilMs, reason: "usage-limit", atMs: nowMs });
+			log({ event: "failure", source: "live-quota", key: exhausted.mark.key, kind: "usage-limit", until: new Date(exhausted.mark.untilMs).toISOString() });
+		}
 		const recover = pool && continues < MAX_CONTINUES && failure && lastTier;
 		let next: string | undefined;
 		let wait: { key: string; atMs: number } | undefined;
 		if (recover) {
 			const nowMs = Date.now();
-			const candidates = candidatesFor(cfg, lastTier!, ruleFor(ctx.cwd), expansion(ctx));
-			const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs) });
+			const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier!, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg);
+			const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs, true) });
 			next = result.chosen ? candidateKey(result.chosen) : undefined;
 			wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
 		}
@@ -614,6 +681,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 			if (!ctx.hasUI) console.log(lines.join("\n"));
 		},
 	});
+}
+
+/** Room left in the account-wide windows, which model-scoped windows do not change. */
+function accountRoom(reading: QuotaReading): number | undefined {
+	const windows = reading.windows.filter((w) => !w.scope);
+	return windows.length ? Math.min(...windows.map((w) => w.remainingPercent)) : undefined;
 }
 
 function parseOverride(pattern: RegExp, text: string): Override | null {

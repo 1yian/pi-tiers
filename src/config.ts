@@ -40,6 +40,8 @@ export interface AutoConfig {
 	/** Markdown headings whose sections are sent instead of the whole message, when present. */
 	sections: string[];
 	maxChars: number;
+	/** How long the provider pick may take before code picks instead. */
+	providerTimeoutMs: number;
 }
 
 export interface Cooldowns {
@@ -78,6 +80,8 @@ export interface Config {
 	/** Live quota used to choose where a session starts; undefined when `quota` is false. */
 	quota?: QuotaConfig;
 	warnProviders: Set<string>;
+	/** Pay-per-token providers: offered only when no subscription candidate is left. */
+	payg: Set<string>;
 	stateDir: string;
 }
 
@@ -157,6 +161,7 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 			minConfidence,
 			sections: a.sections === undefined ? [] : strArray(a.sections, "auto.sections"),
 			maxChars: num(a.maxChars, "auto.maxChars", 12000),
+			providerTimeoutMs: num(a.providerTimeoutSeconds, "auto.providerTimeoutSeconds", 3) * 1000,
 		};
 	}
 
@@ -238,6 +243,7 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		spread: root.spread === true,
 		quota,
 		warnProviders: new Set(root.warnProviders === undefined ? [] : strArray(root.warnProviders, "warnProviders")),
+		payg: new Set(root.payg === undefined ? [] : strArray(root.payg, "payg")),
 		stateDir: root.stateDir === undefined ? join(agentDir, "tiers") : expandHome(str(root.stateDir, "stateDir")),
 	};
 }
