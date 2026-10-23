@@ -1,6 +1,6 @@
 {
   "name": "pi-tiers",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Work tiers for Pi: each tier is a virtual model that commits a session to one model from an ordered chain (resilient tiers keep failover), and tier/auto picks the tier with a classifier.",
   "keywords": ["pi-package", "pi-extension", "router", "virtual-model", "fallback"],
   "license": "MIT",

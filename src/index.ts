@@ -1,6 +1,6 @@
-// pi-tiers: work tiers as virtual models. Each tier commits a session to one model from an ordered
-// chain and only surfaces failures; resilient tiers (compaction, validation) keep failover.
-// `tier/auto` picks the tier with a classifier.
+// pi-tiers: work tiers as virtual models. Every tier commits a session to one model from an ordered chain.
+// A failed call is retried on that model by Pi's own backoff (settings `retry`); only a failure whose live
+// quota check confirms an exhausted account moves the session to another provider. `tier/auto` picks the tier with a classifier.
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -21,7 +21,7 @@ import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
 import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
 import { askProvider, tableRow } from "./provider-pick.ts";
-import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, type Outcome, type QuotaReading, QuotaStore, roomFor } from "./quota.ts";
+import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, kindOf, type Outcome, type QuotaReading, QuotaStore, roomFor } from "./quota.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -90,8 +90,11 @@ export default function piTiers(pi: ExtensionAPI): void {
 	let lastResponse: (ResponseInfo & { key?: string; atMs: number }) | undefined;
 	let lastTier: string | undefined;
 	let lastAssistant: AssistantMessage | undefined;
-	/** Set when the last failed turn was rewritten to the quota line; keeps the provider's own error for cooldowns and the failure log. */
-	let exhausted: { line: string; original: string; mark?: { key: string; untilMs: number } } | undefined;
+	/** Set when the last failed turn's live quota check confirmed an exhausted account; keeps the provider's own error for the failure log.
+	 * `next` is the model the turn continues on, absent when every provider is used up (the turn then ends with `line`). */
+	let exhausted: { line: string; original: string; next?: string } | undefined;
+	/** Sessions (and tiers) whose account just proved exhausted: their next request picks again instead of staying put. */
+	const leaving = new Set<string>();
 	// Size of the most recent request, for choosing a model to continue a failed run on.
 	let lastTokens = 0;
 	let continues = 0;
@@ -187,6 +190,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		return outcomes;
 	};
 
+	/** Whether live quota covers this provider, so a text-classified cooldown is not needed for it. */
+	const live = (provider: string): boolean => Boolean(cfg.quota && kindOf(provider, cfg.quota));
+
 	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
 
 	const isBackground = () => process.env.PI_TIERS_BACKGROUND === "1";
@@ -206,21 +212,6 @@ export default function piTiers(pi: ExtensionAPI): void {
 		return { rotate: cfg.spread ? seedOf(ctx.sessionManager.getSessionId()) : 0, skip: skip.size ? skip : undefined };
 	};
 
-	// How long to wait for a cooling rung instead of failing: background work waits up to
-	// background.maxWaitSeconds, a foreground request up to cooldowns.waitSeconds.
-	const waitFor = (candidates: readonly Candidate[], result: PickResult, nowMs: number, sinceMs: number): { key: string; atMs: number } | undefined => {
-		const cooling = new Set(result.skipped.filter((s) => s.reason === "cooling").map((s) => s.key));
-		let best: { key: string; atMs: number } | undefined;
-		for (const c of candidates) {
-			const key = candidateKey(c);
-			if (!cooling.has(key)) continue;
-			const atMs = store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs);
-			if (!best || atMs < best.atMs) best = { key, atMs };
-		}
-		const limitMs = (isBackground() ? cfg.background.maxWaitSeconds : cfg.cooldowns.waitSeconds) * 1000;
-		return best && best.atMs - sinceMs <= limitMs ? best : undefined;
-	};
-
 	const noteFailure = (
 		provider: string,
 		model: string,
@@ -228,6 +219,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		{ transientCools, notify = true }: { transientCools: boolean; notify?: boolean },
 	): Failure | undefined => {
+		// Providers with a live reader are marked only from a confirmed quota reading, never from error text.
+		if (live(provider)) return undefined;
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
 		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
@@ -292,6 +285,44 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 	};
 
+	// Reads the account's live quota and, when a window for this model is under the floor, marks the account (or the
+	// model, for a model-scoped window) unavailable until the live reset time. A provider with no reader, or a
+	// reading that fails, confirms nothing.
+	const confirmExhausted = async (
+		provider: string,
+		model: string,
+		ctx: ExtensionContext,
+		fresh: boolean,
+	): Promise<{ window: NonNullable<ReturnType<typeof exhaustedWindow>>; line: string } | undefined> => {
+		if (!quota || !cfg.quota || !live(provider)) return undefined;
+		const nowMs = Date.now();
+		const outcome = (await quota.read([provider], (p) => ctx.modelRegistry.getApiKeyForProvider(p), nowMs, fresh)).get(provider);
+		if (!outcome || !("reading" in outcome)) return undefined;
+		clearStaleMarks(new Map([[provider, outcome]]), nowMs);
+		const window = exhaustedWindow(outcome.reading, model, cfg.quota.minRemainingPercent);
+		if (!window) return undefined;
+		if (window.resetAtMs) {
+			const key = window.scope ? modelKey(provider, model) : accountKey(provider);
+			store.set(key, { untilMs: window.resetAtMs, reason: "usage-limit", atMs: Date.now() });
+			log({ event: "failure", source: "live-quota", key, kind: "usage-limit", until: new Date(window.resetAtMs).toISOString() });
+		}
+		return { window, line: `${provider} ${window.label} quota has exhausted. Restart worker to launch on a new provider.` };
+	};
+
+	// The model a turn would continue on after its account ran out: the first usable candidate of the tier, by live quota.
+	// The router makes the final choice (the classifier among the usable ones, code as the fallback).
+	const alternative = async (ctx: ExtensionContext): Promise<string | undefined> => {
+		if (!lastTier || continues >= MAX_CONTINUES) return undefined;
+		const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg);
+		await readQuota(
+			candidates.map((c) => c.provider),
+			ctx,
+			Date.now(),
+		);
+		const result = pick({ candidates, check: checker(ctx, lastTokens, Date.now(), true) });
+		return result.chosen && !result.compacting ? candidateKey(result.chosen) : undefined;
+	};
+
 	const publish = (ctx: ExtensionContext, status: RouteStatus | undefined, text?: string) => {
 		ctx.ui.setStatus(STATUS_KEY, text ?? (status ? formatStatus(status) : undefined));
 		pi.events.emit(ROUTE_EVENT, status ?? null);
@@ -302,7 +333,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const previous = req.state ?? {};
 		const state: TierState = { ...previous };
 
-		// A timeout or dropped connection is retried on the same model; only Pi's last retry moves on.
+		// Pi retries a failed call on the same model with backoff; a provider without a live reader keeps a text-classified mark.
 		if (req.reason === "retry" && req.failed)
 			noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx, { transientCools: false });
 
@@ -322,7 +353,6 @@ export default function piTiers(pi: ExtensionAPI): void {
 			}
 			tier = state.tier ?? cfg.auto?.fallback ?? [...cfg.tiers.keys()][0];
 		}
-		lastTier = tier;
 
 		if (cfg.override && state.override === undefined && req.reason !== "direct") {
 			state.override = parseOverride(cfg.override, messageText(req.messages.find((m: Message) => m.role === "user")));
@@ -339,21 +369,29 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
-		// Stay on the model that last served this session and tier. A resilient tier leaves it when it cools,
-		// fails, or cannot fit the conversation; every other tier never leaves it, whatever happens to it.
+		// Stay on the model that last served this session and tier. It is left only when live quota confirmed the
+		// account exhausted (after a failed turn, or at a direct request's pick time); whatever else happens to it, the session keeps it.
 		const sessionId = ctx.sessionManager.getSessionId();
 		const servedKey = `${sessionId}\0${tier}`;
 		// A session this process has not routed yet is starting here, even when its file already holds a committed
 		// model (a resumed or restarted worker): it picks again, so an account that ran out meanwhile, or one on
 		// PI_TIERS_AVOID, is not kept just because the old process used it.
-		const sticky = routedSessions.has(sessionId)
+		let sticky = routedSessions.has(sessionId)
 			? (state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined))
 			: undefined;
+		// A failed turn confirmed this account exhausted. A direct request (compaction, an extension call) has no failed turn
+		// to confirm anything, so its pick checks the live quota of the model it would stay on.
+		let departed = leaving.delete(servedKey);
+		if (!departed && sticky && req.reason === "direct") {
+			const slash = sticky.indexOf("/");
+			departed = Boolean(await confirmExhausted(sticky.slice(0, slash), sticky.slice(slash + 1), ctx, false));
+		}
+		if (departed) sticky = undefined;
 		const tokens = requestTokens(req.messages);
-		lastTokens = tokens;
-		const resilient = cfg.resilient.has(tier);
-		// Resilient tiers consult live quota too (the shared cache keeps this to one read per account a minute).
-		const check = (at: number) => checker(ctx, tokens, at, resilient);
+		if (req.reason !== "direct") {
+			lastTier = tier;
+			lastTokens = tokens;
+		}
 		let quotaOutcomes: ReadonlyMap<string, Outcome> = new Map();
 		const selectNew = async (): Promise<PickResult> => {
 			// Live quota is read when a session picks its account; a failed or slow reading leaves the
@@ -389,7 +427,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 				load: loadOf,
 				seed: seedOf(sessionId),
 			});
-			if (resilient || req.reason === "direct" || candidates[0]?.position === 0) return scored;
+			if (req.reason === "direct" || candidates[0]?.position === 0) return scored;
 			// The tier is known; now the classifier chooses the provider from the tier's own usable candidates,
 			// subscriptions first. Code validates the answer and falls back to the ranked pick above.
 			const usable = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
@@ -413,42 +451,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 			log({ event: "provider-pick", session: sessionId, tier, ...record });
 			return chosen ? { chosen, skipped: scored.skipped } : scored;
 		};
-		let result: PickResult;
-		let lastResort = false;
-		if (resilient) {
-			await readQuota(
-				candidates.map((c) => c.provider),
-				ctx,
-				nowMs,
-			);
-			result = pick({ candidates, prefer: sticky, check: check(nowMs), contextWindow: windowOf(ctx) });
-			for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
-				const until = new Date(wait.atMs);
-				if (req.reason !== "direct")
-					publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → waiting for ${wait.key} until ${until.toLocaleTimeString()}`);
-				log({ event: "wait", selected, tier, reason: req.reason, key: wait.key, until: until.toISOString(), background: isBackground() });
-				await sleep(wait.atMs - Date.now() + 1000, req.signal);
-				result = pick({ candidates, prefer: sticky, check: check(Date.now()), contextWindow: windowOf(ctx) });
-			}
-			// Compaction and validation must keep working: cooldowns are estimates (direct requests never report
-			// a success that would clear one), so when every rung is cooling, try the one that frees up first.
-			if (!result.chosen) {
-				const fallback = await selectNew();
-				if (fallback.chosen) {
-					result = fallback;
-					lastResort = true;
-				}
-			}
-		} else {
-			const known = sticky ? candidates.find((c) => candidateKey(c) === sticky) : undefined;
-			const model = known && ctx.modelRegistry.find(known.provider, known.model);
-			// Too small for the conversation is not a reason to leave: Pi compacts before sending.
-			const tooSmall = Boolean(model?.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM);
-			result =
-				known && model && ctx.modelRegistry.hasConfiguredAuth(model)
-					? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) }
-					: await selectNew();
-		}
+		const known = sticky ? candidates.find((c) => candidateKey(c) === sticky) : undefined;
+		const stuck = known && ctx.modelRegistry.find(known.provider, known.model);
+		// Too small for the conversation is not a reason to leave: Pi compacts before sending.
+		const tooSmall = Boolean(stuck?.contextWindow && stuck.contextWindow < tokens + CONTEXT_HEADROOM);
+		const result: PickResult =
+			known && stuck && ctx.modelRegistry.hasConfiguredAuth(stuck)
+				? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) }
+				: await selectNew();
 
 		if (!result.chosen) {
 			const why = result.skipped.map((s) => `${s.key}: ${s.reason}`).join(", ") || "empty chain";
@@ -462,7 +472,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		served.set(servedKey, state.key);
 		routedSessions.add(sessionId);
 		lastRouteKey = state.key;
-		if (!resilient) load.assign(sessionId, chosen.provider);
+		if (req.reason !== "direct") load.assign(sessionId, chosen.provider);
 		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${state.key}`);
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
@@ -492,8 +502,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			tokens,
 			...(quotaOutcomes.size ? { quota: quotaSummary(quotaOutcomes) } : {}),
 			...(result.compacting ? { compacting: true } : {}),
-			...(lastResort ? { lastResort: true } : {}),
-			...(resilient ? {} : { assigned: true }),
+			...(departed ? { departed: true } : {}),
 		});
 
 		const changed = JSON.stringify(state) !== JSON.stringify(previous);
@@ -511,7 +520,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 	}
 
 	// Agent-loop requests report their HTTP status here before Pi decides whether to retry, so the
-	// cooldown exists even when the retry budget runs out. Direct requests (compaction summaries,
+	// cooldown exists even when the retry budget runs out. Providers with a live quota reader get none: only a confirmed reading marks them. Direct requests (compaction summaries,
 	// extension calls through the registry) do not emit this event; they are protected only by
 	// cooldowns that agent-loop requests in this or another process already recorded.
 	pi.on("after_provider_response", async (event) => {
@@ -524,6 +533,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const slash = lastRouteKey.indexOf("/");
 		const provider = lastRouteKey.slice(0, slash);
 		const model = lastRouteKey.slice(slash + 1);
+		if (live(provider)) return;
 		const failure = classifyFailure("", { status: event.status, headers: event.headers }, cfg.cooldowns, nowMs);
 		if (!failure) return;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
@@ -546,26 +556,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		continues = 0;
 	});
 
-	// When a turn on a tier fails and the failed account's live quota is used up, the turn's visible error becomes one
-	// line naming the provider and window, so whoever reads the session's error (Fleet's runtime-failure report) gets
-	// exactly that. Any other failure is left as it is.
-	const exhaustedLine = async (
-		failed: AssistantMessage,
-		ctx: ExtensionContext,
-	): Promise<{ line: string; mark?: { key: string; untilMs: number } } | undefined> => {
-		if (!quota || !cfg.quota || ctx.model?.provider !== PROVIDER) return undefined;
-		const outcome = (await quota.read([failed.provider], (p) => ctx.modelRegistry.getApiKeyForProvider(p), Date.now(), true)).get(failed.provider);
-		if (!outcome || !("reading" in outcome)) return undefined;
-		const window = exhaustedWindow(outcome.reading, failed.model, cfg.quota.minRemainingPercent);
-		if (!window) return undefined;
-		// The live reset time is authoritative: the account (or, for a model-scoped window, that model) is out until then.
-		const key = window.scope ? modelKey(failed.provider, failed.model) : accountKey(failed.provider);
-		return {
-			line: `${failed.provider} ${window.label} quota has exhausted. Restart worker to launch on a new provider.`,
-			mark: window.resetAtMs ? { key, untilMs: window.resetAtMs } : undefined,
-		};
-	};
-
+	// A failed turn whose account has run out of quota: the run continues on another provider when one is usable, and ends
+	// with exactly one line naming the provider and window when none is. Any other failure is Pi's to retry (settings `retry`)
+	// on the same model, and when retries run out it is surfaced as it is: pi-tiers never switches provider for it.
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 		lastAssistant = event.message as AssistantMessage;
@@ -573,55 +566,43 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (lastAssistant.stopReason !== "error" && usage)
 			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });
-		if (lastAssistant.stopReason === "error") {
-			const found = await exhaustedLine(lastAssistant, ctx);
-			if (found) {
-				const { line, mark } = found;
-				exhausted = { line, original: lastAssistant.errorMessage ?? "", mark };
-				log({ event: "quota-exhausted", key: `${lastAssistant.provider}/${lastAssistant.model}`, line });
-				lastAssistant = { ...lastAssistant, errorMessage: line };
-				return { message: lastAssistant };
-			}
-		}
+		if (lastAssistant.stopReason !== "error" || ctx.model?.provider !== PROVIDER) return;
+		const failed = lastAssistant;
+		const found = await confirmExhausted(failed.provider, failed.model, ctx, true);
+		if (!found) return;
+		const next = await alternative(ctx);
+		const key = `${failed.provider}/${failed.model}`;
+		exhausted = { line: found.line, original: failed.errorMessage ?? "", next };
+		log({ event: "quota-exhausted", key, line: found.line, next: next ?? null });
+		// Either text is one Pi does not retry: the same account would only fail again.
+		if (next) leaving.add(`${ctx.sessionManager.getSessionId()}\0${lastTier}`);
+		lastAssistant = {
+			...failed,
+			errorMessage: next ? `pi-tiers: ${failed.provider} ${found.window.label} quota exhausted; continuing on another provider.` : found.line,
+		};
+		return { message: lastAssistant };
 	});
 
-	// A failure Pi does not retry (usage limits, exhausted retries) ends the run. On a resilient tier,
-	// cool the account down and ask for one more request, which the router sends to the next usable
-	// model. On any other tier the session keeps its model: the failure is only recorded for Fleet.
+	// A failure Pi no longer retries ends the run. When it was a confirmed quota exhaustion with another provider usable,
+	// ask for one more request, which the router sends there. Otherwise the session keeps its model and the failure
+	// is only recorded for Fleet, which decides whether to restart the worker.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		const failed = lastAssistant;
 		if (event.outcome !== "error" || failed?.stopReason !== "error" || ctx.model?.provider !== PROVIDER) return;
-		const pool = Boolean(lastTier && cfg.resilient.has(lastTier));
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted) return;
-		const failure = noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { transientCools: true, notify: pool });
-		if (exhausted?.mark) {
-			const nowMs = Date.now();
-			store.set(exhausted.mark.key, { untilMs: exhausted.mark.untilMs, reason: "usage-limit", atMs: nowMs });
-			log({ event: "failure", source: "live-quota", key: exhausted.mark.key, kind: "usage-limit", until: new Date(exhausted.mark.untilMs).toISOString() });
-		}
-		const recover = pool && continues < MAX_CONTINUES && failure && lastTier;
-		let next: string | undefined;
-		let wait: { key: string; atMs: number } | undefined;
-		if (recover) {
-			const nowMs = Date.now();
-			const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier!, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg);
-			const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs, true) });
-			next = result.chosen ? candidateKey(result.chosen) : undefined;
-			wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
-		}
-		const continuing = Boolean(recover && (next || wait));
-		surfaceFailure(failed, lastTier, continuing ? "pool" : "none", ctx);
-		if (!continuing || !failure) return;
+		noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { transientCools: true, notify: false });
+		const next = exhausted?.next;
+		surfaceFailure(failed, lastTier, next ? "pool" : "none", ctx);
+		if (!next) return;
 		continues++;
-		const where = next ? `on ${next}` : `on ${wait!.key} when it is free at ${new Date(wait!.atMs).toLocaleTimeString()}`;
 		return {
 			entries: [
 				{
 					type: "custom_message" as const,
 					customType: ENTRY,
-					content: `pi-tiers: ${failed.provider}/${failed.model} failed (${failure.kind}); continuing the interrupted turn ${where}.`,
+					content: `pi-tiers: ${failed.provider}/${failed.model} has no quota left; continuing the interrupted turn on another provider.`,
 					display: true,
 				},
 			],
@@ -729,19 +710,4 @@ function seedOf(sessionId: string): number {
 	let hash = 2166136261;
 	for (let i = 0; i < sessionId.length; i++) hash = Math.imul(hash ^ sessionId.charCodeAt(i), 16777619);
 	return hash >>> 0;
-}
-
-function sleep(ms: number, signal: AbortSignal | undefined): Promise<void> {
-	return new Promise((resolve, reject) => {
-		if (signal?.aborted) return reject(new Error("pi-tiers: wait aborted"));
-		const timer = setTimeout(resolve, Math.max(0, ms));
-		signal?.addEventListener(
-			"abort",
-			() => {
-				clearTimeout(timer);
-				reject(new Error("pi-tiers: wait aborted"));
-			},
-			{ once: true },
-		);
-	});
 }

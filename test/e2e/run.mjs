@@ -31,13 +31,10 @@ const TIERS = {
 	cooldowns: { rateLimitSeconds: 600, serverErrorSeconds: 30, usageLimitSeconds: 3600, authSeconds: 3600 },
 };
 
-function makeHome(name) {
+function makeHome(name, retry = { baseDelayMs: 10, maxAgentDelayMs: 50 }) {
 	const dir = join(OUT, name);
 	mkdirSync(dir, { recursive: true });
-	writeFileSync(
-		join(dir, "settings.json"),
-		JSON.stringify({ quietStartup: true, retry: { enabled: true, maxRetries: 3, baseDelayMs: 10, maxAgentDelayMs: 50 } }),
-	);
+	writeFileSync(join(dir, "settings.json"), JSON.stringify({ quietStartup: true, retry: { enabled: true, maxRetries: 3, ...retry } }));
 	writeFileSync(join(dir, "tiers.json"), JSON.stringify(TIERS, null, 1));
 	return dir;
 }
@@ -138,6 +135,7 @@ function summarize(home, res, calls, before) {
 			error: final.errorMessage,
 		},
 		calls: allCalls.slice(before).map((l) => l.split("\t").join(":")),
+		callTimes: existsSync(`${calls}.ts`) ? readFileSync(`${calls}.ts`, "utf8").split("\n").filter(Boolean).map(Number) : [],
 		custom,
 		routes: log.filter((r) => r.event === "route").slice(-3),
 		autos: log.filter((r) => r.event === "auto"),
@@ -232,14 +230,9 @@ scenario("a non-retryable usage limit ends the run on the assigned account and i
 	return check(ok, r);
 });
 
-scenario("a resilient tier (compact) still fails over and continues the turn", () => {
+scenario("the compact tier follows the same flow as every tier: an error that is not a confirmed quota exhaustion is surfaced, with no switch", () => {
 	const r = runPi(makeHome("pool-usage"), { model: "tier/compact", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
-	const ok =
-		answered(r) === "fake-b/m1" &&
-		r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" &&
-		r.cooldowns.includes("account:fake-a") &&
-		r.failures[0]?.recovery === "pool" &&
-		r.custom.some((c) => c.includes("continuing the interrupted turn"));
+	const ok = r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.recovery === "none";
 	return check(ok, r);
 });
 
@@ -418,41 +411,13 @@ scenario("background work never uses an account kept for the user", () => {
 	return check(ok, { background, overridden, foreground });
 });
 
-scenario("background work on a resilient tier waits for a cooling account instead of failing or falling to the next rung", () => {
-	const home = withTiers(makeHome("background-wait"), (t) => {
-		t.background = { skip: ["fake-small"] };
-		t.resilient = ["pool"];
-	});
-	coolFromOtherProcess(home, "account:fake-c", 3000);
-	const started = Date.now();
-	const r = runPi(home, { model: "tier/pool", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
-	r.waitedMs = Date.now() - started;
-	const waited = readFileSync(join(home, "tiers/log.jsonl"), "utf8").includes('"event":"wait"');
-	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok" && waited && r.waitedMs >= 3000, r);
-});
-
-scenario("a foreground request waits up to cooldowns.waitSeconds for a rung that frees up soon", () => {
-	const home = withTiers(makeHome("foreground-wait"), (t) => {
+scenario("a tier whose only rung is cooling still uses it rather than failing to start", () => {
+	const home = withTiers(makeHome("only-cooling"), (t) => {
 		t.tiers.compact.chain = ["fake-c/m1:low"];
-		t.cooldowns.waitSeconds = 30;
-	});
-	coolFromOtherProcess(home, "account:fake-c", 3000);
-	const started = Date.now();
-	const r = runPi(home, { model: "tier/compact", prompt: "hello" });
-	r.waitedMs = Date.now() - started;
-	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok" && r.waitedMs >= 3000, r);
-});
-
-scenario("a resilient tier whose only rung cools for longer than waitSeconds tries it at once rather than failing", () => {
-	const home = withTiers(makeHome("foreground-no-wait"), (t) => {
-		t.tiers.compact.chain = ["fake-c/m1:low"];
-		t.cooldowns.waitSeconds = 1;
 	});
 	coolFromOtherProcess(home, "account:fake-c", 60_000);
-	const started = Date.now();
 	const r = runPi(home, { model: "tier/compact", prompt: "hello" });
-	r.tookMs = Date.now() - started;
-	return check(answered(r) === "fake-c/m1" && r.routes.at(-1)?.lastResort && r.tookMs < 30_000, r);
+	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok", r);
 });
 
 scenario("compaction-style direct requests on the compact tier keep working when every rung is cooling", () => {
@@ -594,11 +559,13 @@ await scenarioAsync("live quota: parallel starts make one fetch per account and 
 const EXHAUSTED = (provider, window) => `${provider} ${window} quota has exhausted. Restart worker to launch on a new provider.`;
 const visible = (r) => [r.final?.error, ...r.custom];
 
-scenario("a failed turn whose account quota is used up ends with exactly one line naming the provider and window, with no retry or switch", () => {
-	// The first reading (session start) is healthy; the one taken when the turn fails is not.
-	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } } });
+const USED_UP = { five: 0, seven: 0 };
+
+scenario("(d) every provider used up: the failed turn ends with exactly one line naming the provider and window, with no retry or switch", () => {
+	// The first reading (session start) is healthy; the one taken when the turn fails is not. Every other account is used up.
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } }, "fake-b": USED_UP, "fake-c": USED_UP });
 	const fiveH = runPi(withQuota(makeHome("exhausted-5h")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
-	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 90, seven: 2 } } });
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 90, seven: 2 } }, "fake-b": USED_UP, "fake-c": USED_UP });
 	const sevenD = runPi(withQuota(makeHome("exhausted-7d")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
 	const ok =
 		fiveH.final?.error === EXHAUSTED("fake-a", "5h") &&
@@ -715,19 +682,21 @@ scenario("a banked reset: live room before the old reset time clears the usage-l
 	return check(ok, { cleared, held, stillOut });
 });
 
-scenario("a failed turn whose live check confirms an exhausted window marks the account until the live reset time", () => {
-	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } } });
-	const home = withQuota(makeHome("exhausted-mark"));
-	const before = Date.now();
-	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
-	const marks = {};
-	for (const f of readdirSync(join(home, "tiers/cooldowns"))) Object.assign(marks, JSON.parse(readFileSync(join(home, "tiers/cooldowns", f), "utf8")));
-	const account = marks["account:fake-a"];
-	const model = marks["model:fake-a/m1"];
-	// The fake endpoint resets an hour from the reading; the 429's own marks are 2m long.
-	const ok = account?.reason === "usage-limit" && account.untilMs - before > 3500_000 && model && model.untilMs - before < 700_000;
-	return check(ok, { marks });
-});
+scenario(
+	"a failed turn whose live check confirms an exhausted window marks only the account, until the live reset time, and sets no text-classified mark",
+	() => {
+		setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } }, "fake-b": USED_UP, "fake-c": USED_UP });
+		const home = withQuota(makeHome("exhausted-mark"));
+		const before = Date.now();
+		runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
+		const marks = {};
+		for (const f of readdirSync(join(home, "tiers/cooldowns"))) Object.assign(marks, JSON.parse(readFileSync(join(home, "tiers/cooldowns", f), "utf8")));
+		const account = marks["account:fake-a"];
+		// The fake endpoint resets an hour from the reading. The 429 itself marks nothing: fake-a has a live reader.
+		const ok = account?.reason === "usage-limit" && account.untilMs - before > 3500_000 && !marks["model:fake-a/m1"] && Object.keys(marks).length === 1;
+		return check(ok, { marks });
+	},
+);
 
 scenario("pay-per-token providers are labelled in the table, ranked last by code, and chosen only when no subscription is usable", () => {
 	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
@@ -778,7 +747,7 @@ scenario("the classifier sees providers from outside the tier's old chain, and c
 	return check(ok, r);
 });
 
-scenario("the compact tier never calls the classifier, ranks subscriptions before pay-per-token and live quota, and still fails over mid-call", () => {
+scenario("the compact tier is routed like any tier: subscriptions before pay-per-token, live quota first", () => {
 	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
 	const payg = (home) =>
 		withTiers(home, (t) => {
@@ -788,20 +757,7 @@ scenario("the compact tier never calls the classifier, ranks subscriptions befor
 	const ordered = runPi(payg(withQuota(makeHome("compact-payg"))), { model: "tier/compact", prompt: "hello", env: JEV({ first: true }) });
 	setQuota({ "fake-a": { five: 2, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
 	const quotaAware = runPi(withQuota(makeHome("compact-quota")), { model: "tier/compact", prompt: "hello", env: JEV({ first: true }) });
-	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
-	const failover = runPi(payg(withQuota(makeHome("compact-failover"))), {
-		model: "tier/compact",
-		prompt: "hello",
-		plan: { "fake-a/m1": ["usage"] },
-		env: JEV({ first: true }),
-	});
-	const ok =
-		answered(ordered) === "fake-a/m1" &&
-		answered(quotaAware) === "fake-b/m1" &&
-		answered(failover) === "fake-b/m1" &&
-		failover.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" &&
-		[ordered, quotaAware, failover].every((r) => r.jevAsked.length === 0 && r.picks.length === 0);
-	return check(ok, { ordered, quotaAware, failover });
+	return check(answered(ordered) === "fake-a/m1" && answered(quotaAware) === "fake-b/m1", { ordered, quotaAware });
 });
 
 scenario("PI_TIERS_AVOID and a forced rule still hold against the classifier's answer", () => {
@@ -818,6 +774,133 @@ scenario("PI_TIERS_AVOID and a forced rule still hold against the classifier's a
 	});
 	const ok = answered(avoided) === "fake-b/m1" && !rowKeys(avoided).includes("fake-a/m1") && answered(ruled) === "fake-c/m2" && ruled.jevAsked.length === 0;
 	return check(ok, { avoided, ruled });
+});
+
+// ---- Retry with backoff on the same model, repick only on confirmed quota exhaustion -------------
+// Pi's own retry settings carry the backoff: maxRetries 5, baseDelayMs 100, maxAgentDelayMs 1500 is the
+// shape of the shipped 2s, 4s, 8s, 16s, 30s (60s in all), scaled down by 20 and capped the same way.
+const BACKOFF = { maxRetries: 5, baseDelayMs: 100, maxAgentDelayMs: 1500 };
+const gaps = (r) => r.callTimes.slice(1).map((t, i) => t - r.callTimes[i]);
+const growing = (r) => {
+	const g = gaps(r);
+	return g.length >= 3 && g[1] > g[0] * 1.5 && g[2] > g[1] * 1.5;
+};
+
+scenario("(a) a retryable error recovers within the backoff on the same provider and model, with the delays doubling and nothing marked", () => {
+	const home = withQuota(makeHome("retry-recovers", BACKOFF));
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["500", "500", "500"] } });
+	const ok =
+		answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:500,fake-a/m1:500,fake-a/m1:500,fake-a/m1:ok" && growing(r) && r.cooldowns.length === 0;
+	return check(ok, { ...r, gaps: gaps(r) });
+});
+
+scenario("(b) the backoff budget spent with healthy quota surfaces the provider's error: same model throughout, no repick", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const home = withQuota(makeHome("retry-spent", BACKOFF));
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": Array(6).fill("500") } });
+	const total = gaps(r).reduce((a, b) => a + b, 0);
+	// 100 + 200 + 400 + 800 + 1500 = 3000ms of waiting across five retries.
+	const ok =
+		r.final?.stopReason === "error" &&
+		r.final.error.includes("500") &&
+		r.calls.length === 6 &&
+		r.calls.every((c) => c === "fake-a/m1:500") &&
+		total >= 2900 &&
+		r.failures.length === 1 &&
+		r.failures[0].recovery === "none" &&
+		!r.custom.some((c) => c.includes("continuing"));
+	return check(ok, { ...r, gaps: gaps(r), total });
+});
+
+scenario("(c) confirmed quota exhaustion mid-turn skips the retries, repicks (classifier among the usable), and the turn completes on another account", () => {
+	// The reading at the failure (the second) shows fake-a used up; fake-b and fake-c have room.
+	setQuota({
+		"fake-a": { five: 90, seven: 90, after: 1, later: { five: 0, seven: 90 } },
+		"fake-b": { five: 50, seven: 50 },
+		"fake-c": { five: 70, seven: 70 },
+	});
+	const home = withQuota(makeHome("repick", BACKOFF));
+	const r = runPi(home, {
+		model: "tier/default",
+		prompt: "## Captain's intent\nFix the bug.",
+		plan: { "fake-a/m1": ["429", "429", "429"] },
+		env: JEV({ sequence: ["first", "fake-c/m2"] }),
+	});
+	const marks = {};
+	for (const f of readdirSync(join(home, "tiers/cooldowns"))) Object.assign(marks, JSON.parse(readFileSync(join(home, "tiers/cooldowns", f), "utf8")));
+	const asked = r.jevAsked.at(-1);
+	const ok =
+		answered(r) === "fake-c/m2" &&
+		r.calls.join() === "fake-a/m1:429,fake-c/m2:ok" &&
+		marks["account:fake-a"]?.reason === "usage-limit" &&
+		r.picks.at(-1)?.source === "jev" &&
+		Object.keys(asked?.criteria ?? {}).join() === "fake-b/m1,fake-c/m2" &&
+		r.custom.some((c) => c.includes("continuing the interrupted turn on another provider")) &&
+		r.failures[0]?.recovery === "pool";
+	return check(ok, { ...r, marks });
+});
+
+scenario("(c) the code pick continues the turn when the classifier gives no answer", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90, after: 1, later: { five: 0, seven: 90 } }, "fake-b": { five: 50, seven: 50 } });
+	const r = runPi(withQuota(makeHome("repick-code", BACKOFF)), { model: "tier/default", prompt: "do it", plan: { "fake-a/m1": ["usage"] } });
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok", r);
+});
+
+scenario("(e) a banked reset: live room after an earlier exhaustion is picked again at once, with the mark cleared", () => {
+	// Session 1 runs fake-a dry (marked for an hour) and finishes on fake-b. The quota is then restored early.
+	setQuota({ "fake-a": { five: 90, seven: 90, after: 1, later: { five: 0, seven: 90 } }, "fake-b": { five: 60, seven: 60 } });
+	const home = withQuota(makeHome("banked", BACKOFF), { cacheSeconds: 0 });
+	const first = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	const marked = existsSync(join(home, "tiers/cooldowns")) && readdirSync(join(home, "tiers/cooldowns")).length > 0;
+	setQuota({ "fake-a": { five: 95, seven: 95 }, "fake-b": { five: 60, seven: 60 } });
+	const second = runPi(home, { model: "tier/default", prompt: "hello again" });
+	const ok = answered(first) === "fake-b/m1" && marked && answered(second) === "fake-a/m1" && second.cleared[0]?.key === "account:fake-a";
+	return check(ok, { first, second });
+});
+
+scenario("(f) the compact tier follows the same flow: retries on the same model, then repicks on confirmed exhaustion", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const retried = runPi(withQuota(makeHome("compact-retry", BACKOFF)), { model: "tier/compact", prompt: "hello", plan: { "fake-a/m1": ["500", "500"] } });
+	setQuota({ "fake-a": { five: 90, seven: 90, after: 1, later: { five: 0, seven: 90 } }, "fake-b": { five: 50, seven: 50 } });
+	const repicked = runPi(withQuota(makeHome("compact-repick", BACKOFF)), { model: "tier/compact", prompt: "hello", plan: { "fake-a/m1": ["429", "429"] } });
+	const ok =
+		answered(retried) === "fake-a/m1" &&
+		retried.calls.join() === "fake-a/m1:500,fake-a/m1:500,fake-a/m1:ok" &&
+		answered(repicked) === "fake-b/m1" &&
+		repicked.calls.join() === "fake-a/m1:429,fake-b/m1:ok";
+	return check(ok, { retried, repicked });
+});
+
+scenario("(f) a compactor's direct request leaves an account whose live quota is used up, and stays on the account that serves it otherwise", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const stays = runPi(withQuota(makeHome("direct-healthy"), { cacheSeconds: 0 }), {
+		model: "tier/default",
+		prompt: "/direct-probe compact",
+		env: { DIRECT_OUT: join(OUT, "direct-healthy.json") },
+		extra: ["-e", DIRECT],
+	});
+	// The first direct request starts on fake-a; its account is used up before the second one.
+	setQuota({ "fake-a": { five: 90, seven: 90, after: 1, later: { five: 0, seven: 90 } }, "fake-b": { five: 50, seven: 50 } });
+	const leaves = runPi(withQuota(makeHome("direct-exhausted"), { cacheSeconds: 0 }), {
+		model: "tier/default",
+		prompt: "/direct-probe compact",
+		env: { DIRECT_OUT: join(OUT, "direct-exhausted.json") },
+		extra: ["-e", DIRECT],
+	});
+	const results = (name) => JSON.parse(readFileSync(join(OUT, `${name}.json`), "utf8")).results;
+	const ok = results("direct-healthy").every((x) => x === "fake-a/m1:stop") && results("direct-exhausted").join() === "fake-a/m1:stop,fake-b/m1:stop";
+	return check(ok, { stays: results("direct-healthy"), leaves: results("direct-exhausted"), staysRun: stays, leavesRun: leaves });
+});
+
+scenario("(b) a failure with quota left never repicks, even when another account has more room", () => {
+	setQuota({ "fake-a": { five: 20, seven: 90 }, "fake-b": { five: 99, seven: 99 } });
+	const home = withTiers(withQuota(makeHome("no-repick", BACKOFF)), (t) => {
+		t.tiers.default.chain = ["fake-a/m1:high", "fake-b/m1:high"];
+	});
+	// Chain order puts fake-a first and the single-account entries are not grouped, so the session starts on fake-a.
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	return check(r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.recovery === "none", r);
 });
 
 quotaServer.kill();

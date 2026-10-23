@@ -1,7 +1,7 @@
 // Scripted providers for the end-to-end suite. Every call is appended to $FAKE_CALLS; the outcome
 // of the Nth call to provider/model is $FAKE_PLAN[provider/model][N] (default "ok").
 //   ok      answers "OK from provider/model"
-//   429     retryable rate limit with retry-after: 120 (Pi retries it)
+//   429     retryable rate limit with retry-after: 120 (Pi retries it with backoff)
 //   usage   non-retryable usage limit (Pi does not retry it)
 //   500     retryable server error
 //   401     authentication failure
@@ -38,6 +38,7 @@ function nextOutcome(key: string): string {
 	const plan = JSON.parse(process.env.FAKE_PLAN || "{}") as Record<string, string[]>;
 	const outcome = plan[key]?.[prior] ?? "ok";
 	appendFileSync(callsFile, `${key}\t${outcome}\n`);
+	appendFileSync(`${callsFile}.ts`, `${Date.now()}\n`);
 	return outcome;
 }
 
@@ -141,9 +142,12 @@ export default function (pi: ExtensionAPI) {
 					const base = { api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() };
 					const asked = context.questions.provider;
 					if (asked) {
-						// The provider pick: FAKE_JEV is {"choice"}, {"error"}, {"delayMs"}, or {"first": true} (the first listed row);
+						// The provider pick: FAKE_JEV is {"choice"}, {"error"}, {"delayMs"}, {"first": true} (the first listed row), or {"sequence": [...]} (the Nth ask answers the Nth entry, "first" or a row);
 						// without it the pick errors, so code decides. Rows are logged to $FAKE_CALLS.jev, apart from the call log.
 						const spec = JSON.parse(process.env.FAKE_JEV || '{"error":"no plan"}');
+						const asks = existsSync(`${process.env.FAKE_CALLS}.jev`)
+							? readFileSync(`${process.env.FAKE_CALLS}.jev`, "utf8").split("\n").filter(Boolean).length
+							: 0;
 						appendFileSync(`${process.env.FAKE_CALLS}.jev`, `${JSON.stringify({ criteria: asked.criteria, state: (context as { state?: unknown }).state })}\n`);
 						if (spec.delayMs)
 							await new Promise<void>((resolve) => {
@@ -159,7 +163,8 @@ export default function (pi: ExtensionAPI) {
 							});
 						if (options?.signal?.aborted) return { ...base, answers: {}, stopReason: "aborted", errorMessage: "aborted" };
 						if (spec.error) return { ...base, answers: {}, stopReason: "error", errorMessage: spec.error };
-						const choice = spec.first ? Object.keys(asked.criteria)[0] : spec.choice;
+						const wanted = spec.sequence?.[asks] ?? (spec.first ? "first" : spec.choice);
+						const choice = wanted === "first" ? Object.keys(asked.criteria)[0] : wanted;
 						return { ...base, stopReason: "stop", answers: { provider: { type: "choice", choice, confidence: 0.9, probabilities: { [choice]: 0.9 } } } };
 					}
 					const spec = JSON.parse(process.env.FAKE_CLASSIFY || '{"choice":"default","confidence":1}');

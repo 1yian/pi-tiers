@@ -49,16 +49,12 @@ export interface Cooldowns {
 	serverErrorSeconds: number;
 	usageLimitSeconds: number;
 	authSeconds: number;
-	/** A foreground request waits this long at most for a cooling rung instead of failing. */
-	waitSeconds: number;
 }
 
 /** Background work: every request from a process started with PI_TIERS_BACKGROUND=1. */
 export interface Background {
 	/** Providers background work never uses, such as an account kept for the user. */
 	skip: Set<string>;
-	/** How long background work waits for a cooling rung instead of failing or falling further. */
-	maxWaitSeconds: number;
 }
 
 export interface Config {
@@ -70,11 +66,6 @@ export interface Config {
 	override?: RegExp;
 	cooldowns: Cooldowns;
 	background: Background;
-	/**
-	 * Tiers that keep a failover pool of their own: every request walks the chain, cools failing accounts, and
-	 * continues on the next one. Every other tier commits a session to one model and never recovers.
-	 */
-	resilient: Set<string>;
 	/** Start each session on a different member of an account group, chosen from its session id. */
 	spread: boolean;
 	/** Live quota used to choose where a session starts; undefined when `quota` is false. */
@@ -191,18 +182,13 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		serverErrorSeconds: num(c.serverErrorSeconds, "cooldowns.serverErrorSeconds", 30),
 		usageLimitSeconds: num(c.usageLimitSeconds, "cooldowns.usageLimitSeconds", 3600),
 		authSeconds: num(c.authSeconds, "cooldowns.authSeconds", 3600),
-		waitSeconds: num(c.waitSeconds, "cooldowns.waitSeconds", 0),
 	};
 
 	const b = obj(root.background ?? {}, "background");
 	const background: Background = {
 		skip: new Set(b.skip === undefined ? [] : strArray(b.skip, "background.skip")),
-		maxWaitSeconds: num(b.maxWaitSeconds, "background.maxWaitSeconds", 6 * 3600),
 	};
 	if (root.spread !== undefined && typeof root.spread !== "boolean") fail("spread", "expected true or false");
-
-	const resilient = new Set(root.resilient === undefined ? ["compact", "reviewer"].filter((t) => tiers.has(t)) : strArray(root.resilient, "resilient"));
-	for (const t of resilient) if (!tiers.has(t)) fail("resilient", `unknown tier '${t}'`);
 
 	let quota: QuotaConfig | undefined = DEFAULT_QUOTA;
 	if (root.quota === false) quota = undefined;
@@ -239,7 +225,6 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		override: root.override === undefined ? undefined : regex(str(root.override, "override"), "override", fail),
 		cooldowns,
 		background,
-		resilient,
 		spread: root.spread === true,
 		quota,
 		warnProviders: new Set(root.warnProviders === undefined ? [] : strArray(root.warnProviders, "warnProviders")),
