@@ -1,5 +1,6 @@
-// pi-tiers: work tiers as virtual models. Each tier walks an ordered model chain across
-// accounts, cools down accounts that fail, and `tier/auto` picks the tier with a classifier.
+// pi-tiers: work tiers as virtual models. Each tier commits a session to one model from an ordered
+// chain and only surfaces failures; resilient tiers (compaction, validation) keep failover.
+// `tier/auto` picks the tier with a classifier.
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -14,21 +15,27 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AutoDecision, decideTier, lastUserText, messageText } from "./auto.ts";
-import { type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason } from "./chain.ts";
+import { assign, type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason } from "./chain.ts";
 import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THINKING_LEVELS, type Thinking } from "./config.ts";
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
-import { classifyFailure, type Failure, isTransient, type ResponseInfo } from "./failures.ts";
+import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
+import { LoadStore, utilizationFromHeaders } from "./load.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
 export const AUTO = "auto";
 export const STATUS_KEY = "pi-tiers";
 export const ROUTE_EVENT = "pi-tiers:route";
+export const FAILURE_EVENT = "pi-tiers:failure";
 const ENTRY = "pi-tiers";
 /** Room left for the response when checking whether a conversation fits a model's context window. */
 const CONTEXT_HEADROOM = 16_000;
 /** Continuations the extension may request in one run after a request failed outright. */
 const MAX_CONTINUES = 4;
+/** Weights of a provider's load when choosing where a session starts. These are heuristics, not measurements:
+ * quota already used (0..1) outweighs a whole agent, and 500K recent tokens count as one agent. */
+const UTILIZATION_WEIGHT = 10;
+const TOKENS_PER_AGENT = 500_000;
 
 interface Override {
 	provider: string;
@@ -70,6 +77,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 	}
 	const cfg = config;
 	const store = new CooldownStore(cfg.stateDir);
+	const load = new LoadStore(cfg.stateDir);
 	const remotes = new Map<string, string[]>();
 	let lastRouteKey: string | undefined;
 	// Last model chosen per session and tier. Direct requests (compaction, extension calls) carry no
@@ -166,7 +174,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		model: string,
 		errorMessage: string,
 		ctx: ExtensionContext,
-		{ transientCools }: { transientCools: boolean },
+		{ transientCools, notify = true }: { transientCools: boolean; notify?: boolean },
 	): Failure | undefined => {
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
@@ -180,9 +188,55 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
 		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind });
 		log({ event: "failure", key, kind: failure.kind, scope: failure.scope, until: new Date(failure.untilMs).toISOString(), error: errorMessage.slice(0, 300) });
-		if (failure.kind === "auth")
+		if (failure.kind === "auth" && notify)
 			ctx.ui.notify(`pi-tiers: ${provider} rejected its credentials; skipping it until ${new Date(failure.untilMs).toLocaleTimeString()}`, "warning");
 		return failure;
+	};
+
+	// A failure that ends a run is written where Fleet can read it, with the provider's own words and
+	// reset time, whether or not this tier recovers by itself.
+	const surfaceFailure = (failed: AssistantMessage, tier: string | undefined, recovery: "none" | "pool", ctx: ExtensionContext): void => {
+		const nowMs = Date.now();
+		const key = `${failed.provider}/${failed.model}`;
+		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
+		const message = failed.errorMessage ?? "";
+		const classified = classifyFailure(message, response, cfg.cooldowns, nowMs);
+		const resetMs = response ? resetFromHeaders(response.headers, nowMs) : undefined;
+		const headers: Record<string, string> = {};
+		for (const [name, value] of Object.entries(response?.headers ?? {}))
+			if (/retry-after|reset|ratelimit|utilization/i.test(name)) headers[name.toLowerCase()] = value;
+		const record = {
+			v: 1,
+			ts: new Date(nowMs).toISOString(),
+			session: ctx.sessionManager.getSessionId(),
+			pid: process.pid,
+			cwd: ctx.cwd,
+			tier: tier ?? null,
+			provider: failed.provider,
+			model: failed.model,
+			status: response?.status ?? null,
+			kind: classified?.kind ?? (isTransient(message, response) ? "transient" : "unknown"),
+			scope: classified?.scope ?? null,
+			message: message.slice(0, 4000),
+			retryAfter: headers["retry-after"] ?? null,
+			resetAt: resetMs ? new Date(resetMs).toISOString() : null,
+			headers,
+			recovery,
+		};
+		try {
+			mkdirSync(cfg.stateDir, { recursive: true });
+			appendFileSync(join(cfg.stateDir, "failures.jsonl"), `${JSON.stringify(record)}\n`);
+		} catch {
+			// The session entry below still carries it.
+		}
+		log({ event: "surfaced", key, kind: record.kind, status: record.status, recovery });
+		pi.events.emit(FAILURE_EVENT, record);
+		if (recovery === "none") {
+			const when = record.resetAt ? `; resets ${record.resetAt}` : record.retryAfter ? `; retry-after ${record.retryAfter}s` : "";
+			pi.appendEntry<EntryData>(ENTRY, {
+				text: `pi-tiers: ${key} failed (${record.kind}${record.status ? ` ${record.status}` : ""}${when}): ${message.slice(0, 300)}. Not switching models; waiting for recovery.`,
+			});
+		}
 	};
 
 	const publish = (ctx: ExtensionContext, status: RouteStatus | undefined, text?: string) => {
@@ -229,20 +283,54 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
-		// Stay on the model that last served this session and tier until it cools, fails, or cannot fit
-		// the conversation; a higher-priority rung whose cooldown ended does not pull the session back.
-		const servedKey = `${ctx.sessionManager.getSessionId()}\0${tier}`;
+		// Stay on the model that last served this session and tier. A resilient tier leaves it when it cools,
+		// fails, or cannot fit the conversation; every other tier never leaves it, whatever happens to it.
+		const sessionId = ctx.sessionManager.getSessionId();
+		const servedKey = `${sessionId}\0${tier}`;
 		const sticky = state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined);
 		const tokens = requestTokens(req.messages);
 		lastTokens = tokens;
-		let result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, nowMs), contextWindow: windowOf(ctx) });
-		for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
-			const until = new Date(wait.atMs);
-			if (req.reason !== "direct")
-				publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → waiting for ${wait.key} until ${until.toLocaleTimeString()}`);
-			log({ event: "wait", selected, tier, reason: req.reason, key: wait.key, until: until.toISOString(), background: isBackground() });
-			await sleep(wait.atMs - Date.now() + 1000, req.signal);
-			result = pick({ candidates, prefer: sticky, check: checker(ctx, tokens, Date.now()), contextWindow: windowOf(ctx) });
+		const resilient = cfg.resilient.has(tier);
+		const check = (at: number) => checker(ctx, tokens, at);
+		const selectNew = (): PickResult =>
+			assign({
+				candidates,
+				check: check(nowMs),
+				score: (c) => {
+					const l = load.of(c.provider, nowMs, sessionId);
+					return l.utilization * UTILIZATION_WEIGHT + l.agents + l.tokens / TOKENS_PER_AGENT;
+				},
+				freeAt: (c) => store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs),
+				contextWindow: windowOf(ctx),
+			});
+		let result: PickResult;
+		let lastResort = false;
+		if (resilient) {
+			result = pick({ candidates, prefer: sticky, check: check(nowMs), contextWindow: windowOf(ctx) });
+			for (let wait = waitFor(candidates, result, nowMs, nowMs); !result.chosen && wait; wait = waitFor(candidates, result, Date.now(), nowMs)) {
+				const until = new Date(wait.atMs);
+				if (req.reason !== "direct")
+					publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → waiting for ${wait.key} until ${until.toLocaleTimeString()}`);
+				log({ event: "wait", selected, tier, reason: req.reason, key: wait.key, until: until.toISOString(), background: isBackground() });
+				await sleep(wait.atMs - Date.now() + 1000, req.signal);
+				result = pick({ candidates, prefer: sticky, check: check(Date.now()), contextWindow: windowOf(ctx) });
+			}
+			// Compaction and validation must keep working: cooldowns are estimates (direct requests never report
+			// a success that would clear one), so when every rung is cooling, try the one that frees up first.
+			if (!result.chosen) {
+				const fallback = selectNew();
+				if (fallback.chosen) {
+					result = fallback;
+					lastResort = true;
+				}
+			}
+		} else {
+			const known = sticky ? candidates.find((c) => candidateKey(c) === sticky) : undefined;
+			const model = known && ctx.modelRegistry.find(known.provider, known.model);
+			// Too small for the conversation is not a reason to leave: Pi compacts before sending.
+			const tooSmall = Boolean(model?.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM);
+			result =
+				known && model && ctx.modelRegistry.hasConfiguredAuth(model) ? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) } : selectNew();
 		}
 
 		if (!result.chosen) {
@@ -256,6 +344,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		state.key = candidateKey(chosen);
 		served.set(servedKey, state.key);
 		lastRouteKey = state.key;
+		if (!resilient) load.assign(sessionId, chosen.provider);
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
 		// on other tiers) are logged but never published over the session's own route.
@@ -283,6 +372,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 			rule: rule?.name,
 			tokens,
 			...(result.compacting ? { compacting: true } : {}),
+			...(lastResort ? { lastResort: true } : {}),
+			...(resilient ? {} : { assigned: true }),
 		});
 
 		const changed = JSON.stringify(state) !== JSON.stringify(previous);
@@ -306,6 +397,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 	pi.on("after_provider_response", async (event) => {
 		const nowMs = Date.now();
 		lastResponse = { status: event.status, headers: event.headers, key: lastRouteKey, atMs: nowMs };
+		const utilization = utilizationFromHeaders(event.headers);
+		if (utilization !== undefined && lastRouteKey) load.setUtilization(lastRouteKey.slice(0, lastRouteKey.indexOf("/")), utilization, nowMs);
 		const failing = event.status === 401 || event.status === 403 || event.status === 429 || event.status >= 500;
 		if (!failing || !lastRouteKey) return;
 		const slash = lastRouteKey.indexOf("/");
@@ -335,26 +428,36 @@ export default function piTiers(pi: ExtensionAPI): void {
 	pi.on("message_end", async (event) => {
 		if (event.message.role !== "assistant") return;
 		lastAssistant = event.message as AssistantMessage;
+		const usage = lastAssistant.usage;
+		if (lastAssistant.stopReason !== "error" && usage)
+			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });
 	});
 
-	// A failure Pi does not retry (usage limits, exhausted retries) ends the run. Cool the account
-	// down and ask for one more request, which the router sends to the next usable model.
+	// A failure Pi does not retry (usage limits, exhausted retries) ends the run. On a resilient tier,
+	// cool the account down and ask for one more request, which the router sends to the next usable
+	// model. On any other tier the session keeps its model: the failure is only recorded for Fleet.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		const failed = lastAssistant;
 		if (event.outcome !== "error" || failed?.stopReason !== "error" || ctx.model?.provider !== PROVIDER) return;
+		const pool = Boolean(lastTier && cfg.resilient.has(lastTier));
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
-		if (ctx.signal?.aborted || continues >= MAX_CONTINUES) return;
-		const failure = noteFailure(failed.provider, failed.model, failed.errorMessage ?? "", ctx, { transientCools: true });
-		if (!failure || !lastTier) return;
-		const nowMs = Date.now();
-		const rule = ruleFor(ctx.cwd);
-		const candidates = candidatesFor(cfg, lastTier, rule, expansion(ctx));
-		const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs) });
-		const next = result.chosen ? candidateKey(result.chosen) : undefined;
-		const wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
-		if (!next && !wait) return;
+		if (ctx.signal?.aborted) return;
+		const failure = noteFailure(failed.provider, failed.model, failed.errorMessage ?? "", ctx, { transientCools: true, notify: pool });
+		const recover = pool && continues < MAX_CONTINUES && failure && lastTier;
+		let next: string | undefined;
+		let wait: { key: string; atMs: number } | undefined;
+		if (recover) {
+			const nowMs = Date.now();
+			const candidates = candidatesFor(cfg, lastTier!, ruleFor(ctx.cwd), expansion(ctx));
+			const result = pick({ candidates, check: checker(ctx, lastTokens, nowMs) });
+			next = result.chosen ? candidateKey(result.chosen) : undefined;
+			wait = result.chosen ? undefined : waitFor(candidates, result, nowMs, nowMs);
+		}
+		const continuing = Boolean(recover && (next || wait));
+		surfaceFailure(failed, lastTier, continuing ? "pool" : "none", ctx);
+		if (!continuing || !failure) return;
 		continues++;
 		const where = next ? `on ${next}` : `on ${wait!.key} when it is free at ${new Date(wait!.atMs).toLocaleTimeString()}`;
 		return {
@@ -368,6 +471,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 			],
 			continue: true,
 		};
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		load.release(ctx.sessionManager.getSessionId());
 	});
 
 	pi.on("session_start", async (_event, ctx) => {

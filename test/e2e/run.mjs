@@ -21,6 +21,8 @@ const TIERS = {
 		deep: { description: "Research and investigation.", chain: ["fake-c/m2:xhigh"] },
 		big: { description: "Context test.", chain: ["fake-small/tiny:low", "fake-c/m2:low"] },
 		small: { description: "Only a small window.", chain: ["fake-small/tiny:low"] },
+		compact: { description: "Compactor pool.", chain: ["fake/m1:low", "fake-c/m2:low"] },
+		pool: { description: "Waits.", chain: ["fake-c/m1:low", "fake-small/tiny:low"] },
 	},
 	auto: { classifier: "fake-cls/jev", tiers: ["default", "deep"], fallback: "default", minConfidence: 0.6, sections: ["## Captain's intent"] },
 	rules: [{ name: "acme", match: { gitRemote: "github\\.com[:/]acme-corp/" }, tiers: { default: ["fake-c/m2:max"] } }],
@@ -117,6 +119,12 @@ function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {},
 		routes: log.filter((r) => r.event === "route").slice(-3),
 		autos: log.filter((r) => r.event === "auto"),
 		cooldowns: Object.keys(cooldowns).sort(),
+		failures: existsSync(join(home, "tiers/failures.jsonl"))
+			? readFileSync(join(home, "tiers/failures.jsonl"), "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.map((l) => JSON.parse(l))
+			: [],
 	};
 }
 
@@ -162,46 +170,84 @@ scenario("first choice answers when healthy", () => {
 });
 
 let sharedHome;
-scenario("retryable 429 fails over to the next account of the same model", () => {
+scenario("a retryable 429 stays on the assigned account and surfaces the provider error with its Retry-After", () => {
 	sharedHome = makeHome("ratelimit");
-	const r = runPi(sharedHome, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429"] } });
-	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:429,fake-b/m1:ok" && r.cooldowns.includes("model:fake-a/m1"), r);
+	const r = runPi(sharedHome, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
+	const f = r.failures[0];
+	const ok =
+		r.final?.stopReason === "error" &&
+		r.calls.every((c) => c === "fake-a/m1:429") &&
+		f?.status === 429 &&
+		f.kind === "rate-limit" &&
+		f.retryAfter === "120" &&
+		f.resetAt &&
+		f.message.includes("rate_limit_error") &&
+		f.recovery === "none" &&
+		r.custom.some((c) => c.includes("Not switching models"));
+	return check(ok, r);
 });
 
-scenario("a cooldown set by one process is honored by the next process", () => {
+scenario("a new session avoids an account another process recorded as cooling", () => {
 	const r = runPi(sharedHome, { model: "tier/default", prompt: "hello again" });
 	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-b/m1:ok", r);
 });
 
-scenario("non-retryable usage limit cools the account and continues on the next one", () => {
+scenario("a non-retryable usage limit ends the run on the assigned account and is surfaced, with no continuation", () => {
 	const r = runPi(makeHome("usage"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	const ok =
+		r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.kind === "usage-limit" && r.failures[0].recovery === "none";
+	return check(ok, r);
+});
+
+scenario("a resilient tier (compact) still fails over and continues the turn", () => {
+	const r = runPi(makeHome("pool-usage"), { model: "tier/compact", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
 	const ok =
 		answered(r) === "fake-b/m1" &&
 		r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" &&
 		r.cooldowns.includes("account:fake-a") &&
-		r.custom.some((c) => c.includes("pi-tiers"));
+		r.failures[0]?.recovery === "pool" &&
+		r.custom.some((c) => c.includes("continuing the interrupted turn"));
 	return check(ok, r);
 });
 
-scenario("a 403 on one model cools only that model, so the same account's next model still answers", () => {
+scenario("a session start skips a model cooled by a 403 and takes the next chain entry", () => {
 	const home = makeHome("forbidden");
 	const tiers = JSON.parse(readFileSync(join(home, "tiers.json"), "utf8"));
 	tiers.tiers.default.chain = ["fake-c/m1:low", "fake-c/m2:low"];
 	writeFileSync(join(home, "tiers.json"), JSON.stringify(tiers));
-	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-c/m1": ["403"] } });
-	const ok = answered(r) === "fake-c/m2" && r.cooldowns.includes("model:fake-c/m1") && !r.cooldowns.includes("account:fake-c");
-	return check(ok, r);
+	const first = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-c/m1": ["403"] } });
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	const ok =
+		first.final?.stopReason === "error" && first.failures[0]?.kind === "forbidden" && answered(r) === "fake-c/m2" && !r.cooldowns.includes("account:fake-c");
+	return check(ok, { first, r });
 });
 
-scenario("whole account group down falls to the next chain entry (warn provider)", () => {
-	const r = runPi(makeHome("groupdown"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"], "fake-b/m1": ["usage"] } });
+scenario("whole account group cooling at session start moves to the next chain entry", () => {
+	const home = makeHome("groupdown");
+	coolFromOtherProcess(home, "account:fake-a", 60_000);
+	coolFromOtherProcess(home, "account:fake-b", 60_000, "999998");
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
 	return check(answered(r) === "fake-c/m2" && r.routes.at(-1)?.position === 3, r);
 });
 
-scenario("every candidate down ends with a clear error instead of looping", () => {
-	const plan = { "fake-a/m1": ["usage"], "fake-b/m1": ["usage"], "fake-c/m2": ["usage"] };
-	const r = runPi(makeHome("alldown"), { model: "tier/default", prompt: "hello", plan });
-	return check(r.final?.stopReason === "error" && r.calls.length === 3, r);
+scenario("every candidate cooling still assigns the one that frees first, instead of refusing", () => {
+	const home = makeHome("alldown");
+	coolFromOtherProcess(home, "account:fake-a", 120_000);
+	coolFromOtherProcess(home, "account:fake-b", 30_000, "999998");
+	coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	return check(answered(r) === "fake-b/m1" && r.calls.length === 1, r);
+});
+
+scenario("a session starts on the least loaded account: live agents and reported quota use count", () => {
+	const home = makeHome("load");
+	mkdirSync(join(home, "tiers/load"), { recursive: true });
+	const other = (sessions, utilization = {}) => ({ pid: process.pid, updatedMs: Date.now(), sessions, usage: [], utilization });
+	writeFileSync(join(home, "tiers/load/other.json"), JSON.stringify(other({ s1: "fake-a", s2: "fake-a" })));
+	const crowded = runPi(home, { model: "tier/default", prompt: "hello" });
+	writeFileSync(join(home, "tiers/load/other.json"), JSON.stringify(other({ s1: "fake-a" }, { "fake-b": { value: 0.95, atMs: Date.now() } })));
+	const quota = runPi(home, { model: "tier/default", prompt: "hello" });
+	return check(answered(crowded) === "fake-b/m1" && answered(quota) === "fake-a/m1", { crowded, quota });
 });
 
 scenario("auto picks the classifier's tier", () => {
@@ -251,7 +297,7 @@ scenario("PI_TIERS_RULE naming an unknown rule fails closed instead of using the
 
 scenario("direct requests (compaction, extension calls) skip models cooled by an earlier agent-loop failure and leave the status line alone", () => {
 	const home = makeHome("direct");
-	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429"] } });
+	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
 	const out = join(home, "direct.json");
 	const r = runPi(home, { model: "tier/default", prompt: "/direct-probe default", env: { DIRECT_OUT: out }, extra: ["-e", DIRECT] });
 	const { results = [], published = ["missing"] } = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
@@ -290,9 +336,9 @@ function withTiers(home, change) {
 }
 
 /** Cools a key as another Pi process would, for the given number of milliseconds from now. */
-function coolFromOtherProcess(home, key, ms) {
+function coolFromOtherProcess(home, key, ms, file = "999999") {
 	mkdirSync(join(home, "tiers/cooldowns"), { recursive: true });
-	writeFileSync(join(home, "tiers/cooldowns/999999.json"), JSON.stringify({ [key]: { untilMs: Date.now() + ms, reason: "usage-limit" } }));
+	writeFileSync(join(home, `tiers/cooldowns/${file}.json`), JSON.stringify({ [key]: { untilMs: Date.now() + ms, reason: "usage-limit" } }));
 }
 
 scenario("a timeout is retried on the same account, where the prompt cache is, instead of moving to the next one", () => {
@@ -300,16 +346,13 @@ scenario("a timeout is retried on the same account, where the prompt cache is, i
 	return check(answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:timeout,fake-a/m1:ok" && r.cooldowns.length === 0, r);
 });
 
-scenario("a dropped connection moves on to the next account once Pi's retries run out", () => {
+scenario("a dropped connection stays on the assigned account once Pi's retries run out, and is surfaced", () => {
 	const r = runPi(makeHome("connection"), {
 		model: "tier/default",
 		prompt: "hello",
 		plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] },
 	});
-	const ok =
-		answered(r) === "fake-b/m1" &&
-		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-a/m1:connection,fake-b/m1:ok" &&
-		r.cooldowns.includes("model:fake-a/m1");
+	const ok = r.final?.stopReason === "error" && r.calls.length === 4 && r.calls.every((c) => c === "fake-a/m1:connection") && r.failures.length === 1;
 	return check(ok, r);
 });
 
@@ -329,14 +372,14 @@ scenario("background work never uses an account kept for the user", () => {
 	return check(ok, { background, overridden, foreground });
 });
 
-scenario("background work waits for a cooling account instead of failing or falling to the next rung", () => {
+scenario("background work on a resilient tier waits for a cooling account instead of failing or falling to the next rung", () => {
 	const home = withTiers(makeHome("background-wait"), (t) => {
-		t.tiers.default.chain = ["fake-c/m1:low", "fake-small/tiny:low"];
 		t.background = { skip: ["fake-small"] };
+		t.resilient = ["pool"];
 	});
 	coolFromOtherProcess(home, "account:fake-c", 3000);
 	const started = Date.now();
-	const r = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
+	const r = runPi(home, { model: "tier/pool", prompt: "hello", env: { PI_TIERS_BACKGROUND: "1" } });
 	r.waitedMs = Date.now() - started;
 	const waited = readFileSync(join(home, "tiers/log.jsonl"), "utf8").includes('"event":"wait"');
 	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok" && waited && r.waitedMs >= 3000, r);
@@ -344,24 +387,38 @@ scenario("background work waits for a cooling account instead of failing or fall
 
 scenario("a foreground request waits up to cooldowns.waitSeconds for a rung that frees up soon", () => {
 	const home = withTiers(makeHome("foreground-wait"), (t) => {
-		t.tiers.default.chain = ["fake-c/m1:low"];
+		t.tiers.compact.chain = ["fake-c/m1:low"];
 		t.cooldowns.waitSeconds = 30;
 	});
 	coolFromOtherProcess(home, "account:fake-c", 3000);
-	const r = runPi(home, { model: "tier/default", prompt: "hello" });
-	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok", r);
+	const started = Date.now();
+	const r = runPi(home, { model: "tier/compact", prompt: "hello" });
+	r.waitedMs = Date.now() - started;
+	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok" && r.waitedMs >= 3000, r);
 });
 
-scenario("a foreground request still fails at once when the rung frees up later than cooldowns.waitSeconds", () => {
+scenario("a resilient tier whose only rung cools for longer than waitSeconds tries it at once rather than failing", () => {
 	const home = withTiers(makeHome("foreground-no-wait"), (t) => {
-		t.tiers.default.chain = ["fake-c/m1:low"];
+		t.tiers.compact.chain = ["fake-c/m1:low"];
 		t.cooldowns.waitSeconds = 1;
 	});
 	coolFromOtherProcess(home, "account:fake-c", 60_000);
 	const started = Date.now();
-	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	const r = runPi(home, { model: "tier/compact", prompt: "hello" });
 	r.tookMs = Date.now() - started;
-	return check(r.final?.stopReason === "error" && r.calls.length === 0 && r.tookMs < 30_000, r);
+	return check(answered(r) === "fake-c/m1" && r.routes.at(-1)?.lastResort && r.tookMs < 30_000, r);
+});
+
+scenario("compaction-style direct requests on the compact tier keep working when every rung is cooling", () => {
+	const home = makeHome("compact-cooling");
+	coolFromOtherProcess(home, "account:fake-a", 120_000);
+	coolFromOtherProcess(home, "account:fake-b", 30_000, "999998");
+	coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+	const out = join(home, "direct.json");
+	const r = runPi(home, { model: "tier/default", prompt: "/direct-probe compact", env: { DIRECT_OUT: out }, extra: ["-e", DIRECT] });
+	const { results = [] } = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
+	r.direct = results;
+	return check(results.length === 2 && results.every((x) => x === "fake-b/m1:stop"), r);
 });
 
 scenario("with spread on, sessions start on different accounts of a group", () => {

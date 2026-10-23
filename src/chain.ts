@@ -8,6 +8,8 @@ export interface Candidate {
 	thinking: Thinking;
 	/** 1-based position in the expanded chain. */
 	position: number;
+	/** Index of the chain entry this came from; members of one account group share it. -1 for an override. */
+	group?: number;
 }
 
 export const candidateKey = (c: { provider: string; model: string }) => `${c.provider}/${c.model}`;
@@ -29,13 +31,13 @@ export function candidatesFor(config: Config, tier: string, rule: Rule | undefin
 	const chain: ChainEntry[] = replacement ?? config.tiers.get(tier)?.chain ?? [];
 	const allow = replacement ? undefined : rule?.allowProviders;
 	const out: Candidate[] = [];
-	for (const entry of chain) {
+	for (const [index, entry] of chain.entries()) {
 		const group = config.accounts.get(entry.provider);
 		const members = group ? rotated(group, rotate) : [entry.provider];
 		for (const provider of members) {
 			if (allow && !allow.has(provider)) continue;
 			if (skip?.has(provider)) continue;
-			out.push({ provider, model: entry.model, thinking: entry.thinking, position: out.length + 1 });
+			out.push({ provider, model: entry.model, thinking: entry.thinking, position: out.length + 1, group: index });
 		}
 	}
 	return out;
@@ -80,6 +82,53 @@ export function pick({ candidates, prefer, check, contextWindow }: PickInput): P
 	// Every usable rung is only too small: take the largest window and let Pi compact before sending,
 	// rather than failing a request that a compacted conversation could still serve.
 	if (tooSmall.length && contextWindow) {
+		const largest = tooSmall.reduce((best, c) => (contextWindow(c) > contextWindow(best) ? c : best));
+		return { chosen: largest, skipped, compacting: true };
+	}
+	return { skipped };
+}
+
+export interface AssignInput {
+	candidates: Candidate[];
+	check: (c: Candidate) => SkipReason | undefined;
+	/** Current load on the candidate's account; lower is better. */
+	score: (c: Candidate) => number;
+	/** When the candidate's known cooldown ends (ms); only used when every usable candidate is cooling. */
+	freeAt: (c: Candidate) => number;
+	contextWindow: (c: Candidate) => number;
+}
+
+/**
+ * Chooses the one candidate a session commits to. The chain is a preference order of models: the
+ * first chain entry with a usable account wins, and within it the least loaded account. A cooldown
+ * is evidence the account is exhausted, so it ranks a candidate last but never removes it, because
+ * a stale or wrong cooldown must not leave the session without a model.
+ */
+export function assign({ candidates, check, score, freeAt, contextWindow }: AssignInput): PickResult {
+	const skipped: PickResult["skipped"] = [];
+	const ready: Candidate[] = [];
+	const cooling: Candidate[] = [];
+	const tooSmall: Candidate[] = [];
+	for (const c of candidates) {
+		const reason = check(c);
+		if (!reason) ready.push(c);
+		else if (reason === "cooling") cooling.push(c);
+		else {
+			skipped.push({ key: candidateKey(c), reason });
+			if (reason === "context-too-small") tooSmall.push(c);
+		}
+	}
+	const byOrder = (a: Candidate, b: Candidate) => (a.group ?? 0) - (b.group ?? 0) || a.position - b.position;
+	if (ready.length) {
+		const first = Math.min(...ready.map((c) => c.group ?? 0));
+		const best = ready.filter((c) => (c.group ?? 0) === first).sort((a, b) => score(a) - score(b) || a.position - b.position)[0];
+		return { chosen: best, skipped };
+	}
+	if (cooling.length) {
+		const best = [...cooling].sort((a, b) => freeAt(a) - freeAt(b) || byOrder(a, b))[0];
+		return { chosen: best, skipped };
+	}
+	if (tooSmall.length) {
 		const largest = tooSmall.reduce((best, c) => (contextWindow(c) > contextWindow(best) ? c : best));
 		return { chosen: largest, skipped, compacting: true };
 	}
