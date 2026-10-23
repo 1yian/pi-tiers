@@ -173,7 +173,9 @@ function sessionEntries(home) {
 }
 
 const results = [];
+const only = process.env.E2E_ONLY;
 function scenario(name, fn) {
+	if (only && !name.includes(only)) return;
 	let outcome;
 	try {
 		outcome = fn();
@@ -352,6 +354,7 @@ scenario("the same small-window model is used when the conversation fits", () =>
 });
 
 async function scenarioAsync(name, fn) {
+	if (only && !name.includes(only)) return;
 	let outcome;
 	try {
 		outcome = await fn();
@@ -475,6 +478,16 @@ scenario("with spread on, sessions start on different accounts of a group", () =
 	);
 });
 
+scenario("a session resumed on the same session file picks its account again instead of keeping the old one", () => {
+	const home = makeHome("resume");
+	const id = "00000000-0000-4000-8000-0000000002aa";
+	const first = runPi(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] });
+	// The account that served the session runs out between the first run and the restart.
+	coolFromOtherProcess(home, "account:fake-a", 60_000);
+	const resumed = runPi(home, { model: "tier/default", prompt: "hello again", extra: ["--session-id", id] });
+	return check(answered(first) === "fake-a/m1" && answered(resumed) === "fake-b/m1", { first, resumed });
+});
+
 // ---- Live quota -------------------------------------------------------------------------------
 const quotaPlan = join(OUT, "quota-plan.json");
 const quotaLog = join(OUT, "quota-requests.log");
@@ -568,6 +581,53 @@ await scenarioAsync("live quota: parallel starts make one fetch per account and 
 	const counts = Object.fromEntries(["key-fake-a", "key-fake-b"].map((t) => [t, fetches.filter((f) => f === t).length]));
 	const ok = landed.every(Boolean) && counts["key-fake-a"] === 1 && counts["key-fake-b"] === 1 && new Set(landed).size === 2;
 	return check(ok, { landed, counts, runs: runs.map((r) => r.stderr) });
+});
+
+const EXHAUSTED = (provider, window) => `${provider} ${window} quota has exhausted. Restart worker to launch on a new provider.`;
+const visible = (r) => [r.final?.error, ...r.custom];
+
+scenario("a failed turn whose account quota is used up ends with exactly one line naming the provider and window, with no retry or switch", () => {
+	// The first reading (session start) is healthy; the one taken when the turn fails is not.
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } } });
+	const fiveH = runPi(withQuota(makeHome("exhausted-5h")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 90, seven: 2 } } });
+	const sevenD = runPi(withQuota(makeHome("exhausted-7d")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
+	const ok =
+		fiveH.final?.error === EXHAUSTED("fake-a", "5h") &&
+		sevenD.final?.error === EXHAUSTED("fake-a", "7d") &&
+		fiveH.calls.join() === "fake-a/m1:usage" &&
+		sevenD.calls.length === 1 &&
+		!fiveH.custom.some((c) => c.includes("Not switching")) &&
+		!sevenD.custom.some((c) => c.includes("Not switching"));
+	return check(ok, { fiveH, sevenD });
+});
+
+scenario("a failed turn with quota left, or a failed quota read, keeps the provider's own error and prints nothing extra", () => {
+	setQuota({ "fake-a": { five: 80, seven: 80 } });
+	const left = runPi(withQuota(makeHome("exhausted-no")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { status: 500 } } });
+	const unreadable = runPi(withQuota(makeHome("exhausted-unreadable")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
+	const own = (r) => r.final?.error?.includes("FreeUsageLimitError") && r.custom.some((c) => c.includes("Not switching models"));
+	return check(own(left) && own(unreadable) && !visible(left).some((t) => t?.includes("quota has exhausted")), { left, unreadable });
+});
+
+scenario("PI_TIERS_AVOID excludes providers by exact name, on a fresh start and on a resumed session", () => {
+	const home = makeHome("avoid");
+	const id = "00000000-0000-4000-8000-0000000003aa";
+	const fresh = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_AVOID: "fake-a" } });
+	const first = runPi(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] });
+	const resumed = runPi(home, { model: "tier/default", prompt: "again", extra: ["--session-id", id], env: { PI_TIERS_AVOID: " fake-a , nope" } });
+	const both = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_AVOID: "fake-a,fake-b" } });
+	const ok = answered(fresh) === "fake-b/m1" && answered(first) === "fake-a/m1" && answered(resumed) === "fake-b/m1" && answered(both) === "fake-c/m2";
+	return check(ok, { fresh, first, resumed, both });
+});
+
+scenario("PI_TIERS_AVOID that leaves nothing for the tier fails with one clear line and makes no request", () => {
+	const r = runPi(makeHome("avoid-all"), { model: "tier/deep", prompt: "hello", env: { PI_TIERS_AVOID: "fake-c" } });
+	return check(
+		r.final?.stopReason === "error" && r.final.error === "pi-tiers: PI_TIERS_AVOID (fake-c) leaves no provider for tier 'deep'." && r.calls.length === 0,
+		r,
+	);
 });
 
 quotaServer.kill();
