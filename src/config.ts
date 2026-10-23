@@ -67,6 +67,11 @@ export interface Config {
 	override?: RegExp;
 	cooldowns: Cooldowns;
 	background: Background;
+	/**
+	 * Tiers that keep a failover pool of their own: every request walks the chain, cools failing accounts, and
+	 * continues on the next one. Every other tier commits a session to one model and never recovers.
+	 */
+	resilient: Set<string>;
 	/** Start each session on a different member of an account group, chosen from its session id. */
 	spread: boolean;
 	warnProviders: Set<string>;
@@ -188,6 +193,9 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 	};
 	if (root.spread !== undefined && typeof root.spread !== "boolean") fail("spread", "expected true or false");
 
+	const resilient = new Set(root.resilient === undefined ? ["compact", "reviewer"].filter((t) => tiers.has(t)) : strArray(root.resilient, "resilient"));
+	for (const t of resilient) if (!tiers.has(t)) fail("resilient", `unknown tier '${t}'`);
+
 	return {
 		path,
 		accounts,
@@ -197,6 +205,7 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		override: root.override === undefined ? undefined : regex(str(root.override, "override"), "override", fail),
 		cooldowns,
 		background,
+		resilient,
 		spread: root.spread === true,
 		warnProviders: new Set(root.warnProviders === undefined ? [] : strArray(root.warnProviders, "warnProviders")),
 		stateDir: root.stateDir === undefined ? join(agentDir, "tiers") : expandHome(str(root.stateDir, "stateDir")),
