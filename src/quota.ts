@@ -83,6 +83,13 @@ export function exhaustedUntilMs(reading: QuotaReading, model: string, minPercen
 	return low.length ? Math.max(...low.map((w) => w.resetAtMs!)) : undefined;
 }
 
+/** The window with the least left for this model when it is under `minPercent`, or undefined when none is. */
+export function exhaustedWindow(reading: QuotaReading, model: string, minPercent: number): QuotaWindow | undefined {
+	const lower = model.toLowerCase();
+	const low = reading.windows.filter((w) => (!w.scope || lower.includes(w.scope)) && w.remainingPercent < minPercent);
+	return low.sort((a, b) => a.remainingPercent - b.remainingPercent)[0];
+}
+
 export function describe(reading: QuotaReading): string {
 	return reading.windows.map((w) => `${w.label} ${Math.round(w.remainingPercent)}%`).join(", ");
 }
@@ -265,13 +272,13 @@ export class QuotaStore {
 	}
 
 	/** Readings for every provider that has a reader, within the total time budget. Never throws. */
-	async read(providers: Iterable<string>, apiKey: Fetcher["apiKey"], nowMs: number = Date.now()): Promise<Map<string, Outcome>> {
+	async read(providers: Iterable<string>, apiKey: Fetcher["apiKey"], nowMs: number = Date.now(), fresh = false): Promise<Map<string, Outcome>> {
 		const out = new Map<string, Outcome>();
 		const controller = new AbortController();
 		const timer = setTimeout(() => controller.abort(), this.cfg.timeoutMs);
 		try {
 			const unique = [...new Set(providers)];
-			const outcomes = await Promise.all(unique.map((provider) => this.one(provider, controller.signal, nowMs, apiKey)));
+			const outcomes = await Promise.all(unique.map((provider) => this.one(provider, controller.signal, nowMs, apiKey, fresh)));
 			// Results keep the order the providers were asked in, whichever finished first.
 			unique.forEach((provider, i) => {
 				const outcome = outcomes[i];
@@ -286,12 +293,12 @@ export class QuotaStore {
 		return out;
 	}
 
-	private one(provider: string, signal: AbortSignal, nowMs: number, apiKey: Fetcher["apiKey"]): Promise<Outcome | undefined> | undefined {
+	private one(provider: string, signal: AbortSignal, nowMs: number, apiKey: Fetcher["apiKey"], fresh: boolean): Promise<Outcome | undefined> | undefined {
 		const kind = kindOf(provider, this.cfg);
 		if (!kind) return undefined;
 		let pending = this.inflight.get(provider);
 		if (!pending) {
-			pending = this.resolve(provider, kind, signal, nowMs, apiKey).finally(() => this.inflight.delete(provider));
+			pending = this.resolve(provider, kind, signal, nowMs, apiKey, fresh).finally(() => this.inflight.delete(provider));
 			this.inflight.set(provider, pending);
 		}
 		return pending;
@@ -306,15 +313,15 @@ export class QuotaStore {
 		return undefined;
 	}
 
-	private async resolve(provider: string, kind: QuotaKind, signal: AbortSignal, nowMs: number, apiKey: Fetcher["apiKey"]): Promise<Outcome> {
-		const hit = this.cached(provider, nowMs);
+	private async resolve(provider: string, kind: QuotaKind, signal: AbortSignal, nowMs: number, apiKey: Fetcher["apiKey"], fresh: boolean): Promise<Outcome> {
+		const hit = fresh ? undefined : this.cached(provider, nowMs);
 		if (hit) return hit;
 		mkdirSync(this.dir, { recursive: true });
 		const lock = join(this.dir, `${provider}.lock`);
 		while (!signal.aborted) {
 			if (tryLock(lock, this.cfg.timeoutMs + 2000)) {
 				try {
-					const again = this.cached(provider, Date.now());
+					const again = fresh ? undefined : this.cached(provider, Date.now());
 					if (again) return again;
 					return await this.fetchAndStore(provider, kind, signal, apiKey);
 				} finally {

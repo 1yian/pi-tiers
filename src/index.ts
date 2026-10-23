@@ -20,7 +20,7 @@ import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THI
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
 import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
-import { describe as describeQuota, exhaustedUntilMs, type Outcome, QuotaStore, roomFor } from "./quota.ts";
+import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, type Outcome, QuotaStore, roomFor } from "./quota.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -85,9 +85,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 	// Last model chosen per session and tier. Direct requests (compaction, extension calls) carry no
 	// router state, so this is what keeps them on the account that is already working.
 	const served = new Map<string, string>();
+	const routedSessions = new Set<string>();
 	let lastResponse: (ResponseInfo & { key?: string; atMs: number }) | undefined;
 	let lastTier: string | undefined;
 	let lastAssistant: AssistantMessage | undefined;
+	/** Set when the last failed turn was rewritten to the quota line; keeps the provider's own error for cooldowns and the failure log. */
+	let exhausted: { line: string; original: string } | undefined;
 	// Size of the most recent request, for choosing a model to continue a failed run on.
 	let lastTokens = 0;
 	let continues = 0;
@@ -168,10 +171,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 	// Background work leaves out the providers kept for the user; with `spread`, each session starts on
 	// its own member of every account group, so one account's limit moves only the sessions it served.
-	const expansion = (ctx: ExtensionContext): Expansion => ({
-		rotate: cfg.spread ? seedOf(ctx.sessionManager.getSessionId()) : 0,
-		skip: isBackground() ? cfg.background.skip : undefined,
-	});
+	// PI_TIERS_AVOID names providers (exactly as pi-tiers prints them) a restarted worker must not land on again.
+	const avoided = (): Set<string> =>
+		new Set(
+			(process.env.PI_TIERS_AVOID ?? "")
+				.split(",")
+				.map((n) => n.trim())
+				.filter(Boolean),
+		);
+	const expansion = (ctx: ExtensionContext): Expansion => {
+		const skip = new Set([...(isBackground() ? cfg.background.skip : []), ...avoided()]);
+		return { rotate: cfg.spread ? seedOf(ctx.sessionManager.getSessionId()) : 0, skip: skip.size ? skip : undefined };
+	};
 
 	// How long to wait for a cooling rung instead of failing: background work waits up to
 	// background.maxWaitSeconds, a foreground request up to cooldowns.waitSeconds.
@@ -218,7 +229,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const nowMs = Date.now();
 		const key = `${failed.provider}/${failed.model}`;
 		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
-		const message = failed.errorMessage ?? "";
+		const message = exhausted?.original ?? failed.errorMessage ?? "";
 		const classified = classifyFailure(message, response, cfg.cooldowns, nowMs);
 		const resetMs = response ? resetFromHeaders(response.headers, nowMs) : undefined;
 		const headers: Record<string, string> = {};
@@ -250,7 +261,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 		log({ event: "surfaced", key, kind: record.kind, status: record.status, recovery });
 		pi.events.emit(FAILURE_EVENT, record);
-		if (recovery === "none") {
+		// A used-up quota is already the session's one visible line; nothing else is printed for it.
+		if (recovery === "none" && !exhausted) {
 			const when = record.resetAt ? `; resets ${record.resetAt}` : record.retryAfter ? `; retry-after ${record.retryAfter}s` : "";
 			pi.appendEntry<EntryData>(ENTRY, {
 				text: `pi-tiers: ${key} failed (${record.kind}${record.status ? ` ${record.status}` : ""}${when}): ${message.slice(0, 300)}. Not switching models; waiting for recovery.`,
@@ -298,6 +310,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const rule = ruleFor(ctx.cwd);
 		const expand = expansion(ctx);
 		let candidates = candidatesFor(cfg, tier, rule, expand);
+		if (!candidates.length && avoided().size && candidatesFor(cfg, tier, rule, { ...expand, skip: undefined }).length) {
+			throw new Error(`pi-tiers: PI_TIERS_AVOID (${[...avoided()].join(",")}) leaves no provider for tier '${tier}'.`);
+		}
 		const override = state.override;
 		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
@@ -306,7 +321,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// fails, or cannot fit the conversation; every other tier never leaves it, whatever happens to it.
 		const sessionId = ctx.sessionManager.getSessionId();
 		const servedKey = `${sessionId}\0${tier}`;
-		const sticky = state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined);
+		// A session this process has not routed yet is starting here, even when its file already holds a committed
+		// model (a resumed or restarted worker): it picks again, so an account that ran out meanwhile, or one on
+		// PI_TIERS_AVOID, is not kept just because the old process used it.
+		const sticky = routedSessions.has(sessionId)
+			? (state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined))
+			: undefined;
 		const tokens = requestTokens(req.messages);
 		lastTokens = tokens;
 		const resilient = cfg.resilient.has(tier);
@@ -388,6 +408,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const model = ctx.modelRegistry.find(chosen.provider, chosen.model)!;
 		state.key = candidateKey(chosen);
 		served.set(servedKey, state.key);
+		routedSessions.add(sessionId);
 		lastRouteKey = state.key;
 		if (!resilient) load.assign(sessionId, chosen.provider);
 		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${state.key}`);
@@ -469,16 +490,37 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 	pi.on("agent_start", async () => {
 		lastAssistant = undefined;
+		exhausted = undefined;
 		continues = 0;
 	});
 
-	pi.on("message_end", async (event) => {
+	// When a turn on a tier fails and the failed account's live quota is used up, the turn's visible error becomes one
+	// line naming the provider and window, so whoever reads the session's error (Fleet's runtime-failure report) gets
+	// exactly that. Any other failure is left as it is.
+	const exhaustedLine = async (failed: AssistantMessage, ctx: ExtensionContext): Promise<string | undefined> => {
+		if (!quota || !cfg.quota || ctx.model?.provider !== PROVIDER) return undefined;
+		const outcome = (await quota.read([failed.provider], (p) => ctx.modelRegistry.getApiKeyForProvider(p), Date.now(), true)).get(failed.provider);
+		if (!outcome || !("reading" in outcome)) return undefined;
+		const window = exhaustedWindow(outcome.reading, failed.model, cfg.quota.minRemainingPercent);
+		return window ? `${failed.provider} ${window.label} quota has exhausted. Restart worker to launch on a new provider.` : undefined;
+	};
+
+	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 		lastAssistant = event.message as AssistantMessage;
 		const usage = lastAssistant.usage;
 		if (lastAssistant.stopReason !== "error" && usage)
 			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });
+		if (lastAssistant.stopReason === "error") {
+			const line = await exhaustedLine(lastAssistant, ctx);
+			if (line) {
+				exhausted = { line, original: lastAssistant.errorMessage ?? "" };
+				log({ event: "quota-exhausted", key: `${lastAssistant.provider}/${lastAssistant.model}`, line });
+				lastAssistant = { ...lastAssistant, errorMessage: line };
+				return { message: lastAssistant };
+			}
+		}
 	});
 
 	// A failure Pi does not retry (usage limits, exhausted retries) ends the run. On a resilient tier,
@@ -491,7 +533,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted) return;
-		const failure = noteFailure(failed.provider, failed.model, failed.errorMessage ?? "", ctx, { transientCools: true, notify: pool });
+		const failure = noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { transientCools: true, notify: pool });
 		const recover = pool && continues < MAX_CONTINUES && failure && lastTier;
 		let next: string | undefined;
 		let wait: { key: string; atMs: number } | undefined;
