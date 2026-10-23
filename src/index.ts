@@ -20,6 +20,7 @@ import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THI
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
 import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
+import { describe as describeQuota, exhaustedUntilMs, type Outcome, QuotaStore, roomFor } from "./quota.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -78,6 +79,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 	const cfg = config;
 	const store = new CooldownStore(cfg.stateDir);
 	const load = new LoadStore(cfg.stateDir);
+	const quota = cfg.quota ? new QuotaStore(cfg.stateDir, cfg.quota, agentDir) : undefined;
 	const remotes = new Map<string, string[]>();
 	let lastRouteKey: string | undefined;
 	// Last model chosen per session and tier. Direct requests (compaction, extension calls) carry no
@@ -133,15 +135,32 @@ export default function piTiers(pi: ExtensionAPI): void {
 	};
 
 	const checker =
-		(ctx: ExtensionContext, tokens: number, nowMs: number) =>
+		(ctx: ExtensionContext, tokens: number, nowMs: number, useQuota = false) =>
 		(c: Candidate): SkipReason | undefined => {
 			const model = ctx.modelRegistry.find(c.provider, c.model);
 			if (!model) return "unknown-model";
 			if (!ctx.modelRegistry.hasConfiguredAuth(model)) return "no-credentials";
 			if (store.get(accountKey(c.provider), nowMs) || store.get(modelKey(c.provider, c.model), nowMs)) return "cooling";
+			if (useQuota && quota && cfg.quota) {
+				const reading = quota.latest.get(c.provider);
+				const room = reading && roomFor(reading, c.model);
+				if (room !== undefined && room < cfg.quota.minRemainingPercent) return "quota-low";
+			}
 			if (tokens && model.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM) return "context-too-small";
 			return undefined;
 		};
+
+	const quotaSummary = (outcomes: ReadonlyMap<string, Outcome>) =>
+		Object.fromEntries(
+			[...outcomes].map(([provider, o]) => [
+				provider,
+				"reading" in o
+					? { source: o.source, windows: o.reading.windows.map((w) => ({ label: w.label, left: Math.round(w.remainingPercent), scope: w.scope })) }
+					: { source: o.source, error: o.error },
+			]),
+		);
+	const quotaLine = (outcomes: ReadonlyMap<string, Outcome>) =>
+		[...outcomes].map(([provider, o]) => `${provider} ${"reading" in o ? `${describeQuota(o.reading)} (${o.source})` : `unavailable: ${o.error}`}`).join("; ");
 
 	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
 
@@ -292,17 +311,41 @@ export default function piTiers(pi: ExtensionAPI): void {
 		lastTokens = tokens;
 		const resilient = cfg.resilient.has(tier);
 		const check = (at: number) => checker(ctx, tokens, at);
-		const selectNew = (): PickResult =>
-			assign({
+		let quotaOutcomes: ReadonlyMap<string, Outcome> = new Map();
+		const selectNew = async (): Promise<PickResult> => {
+			// Live quota is read once here, when a session picks its account; a failed or slow reading leaves the
+			// header-based score in charge and never delays the start by more than quota.timeoutSeconds.
+			if (quota)
+				quotaOutcomes = await quota.read(
+					candidates.map((c) => c.provider),
+					(p) => ctx.modelRegistry.getApiKeyForProvider(p),
+				);
+			const roomOf = (c: Candidate) => {
+				const reading = quota?.latest.get(c.provider);
+				return reading && roomFor(reading, c.model);
+			};
+			const loadOf = (c: Candidate) => {
+				const l = load.of(c.provider, nowMs, sessionId);
+				return l.agents + l.tokens / TOKENS_PER_AGENT;
+			};
+			return assign({
 				candidates,
-				check: check(nowMs),
+				check: checker(ctx, tokens, nowMs, true),
 				score: (c) => {
 					const l = load.of(c.provider, nowMs, sessionId);
 					return l.utilization * UTILIZATION_WEIGHT + l.agents + l.tokens / TOKENS_PER_AGENT;
 				},
-				freeAt: (c) => store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs),
+				freeAt: (c) => {
+					const reading = quota?.latest.get(c.provider);
+					const quotaFree = (reading && cfg.quota && exhaustedUntilMs(reading, c.model, cfg.quota.minRemainingPercent)) || 0;
+					return Math.max(store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs), quotaFree);
+				},
 				contextWindow: windowOf(ctx),
+				room: roomOf,
+				load: loadOf,
+				seed: seedOf(sessionId),
 			});
+		};
 		let result: PickResult;
 		let lastResort = false;
 		if (resilient) {
@@ -318,7 +361,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			// Compaction and validation must keep working: cooldowns are estimates (direct requests never report
 			// a success that would clear one), so when every rung is cooling, try the one that frees up first.
 			if (!result.chosen) {
-				const fallback = selectNew();
+				const fallback = await selectNew();
 				if (fallback.chosen) {
 					result = fallback;
 					lastResort = true;
@@ -330,7 +373,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 			// Too small for the conversation is not a reason to leave: Pi compacts before sending.
 			const tooSmall = Boolean(model?.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM);
 			result =
-				known && model && ctx.modelRegistry.hasConfiguredAuth(model) ? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) } : selectNew();
+				known && model && ctx.modelRegistry.hasConfiguredAuth(model)
+					? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) }
+					: await selectNew();
 		}
 
 		if (!result.chosen) {
@@ -345,6 +390,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		served.set(servedKey, state.key);
 		lastRouteKey = state.key;
 		if (!resilient) load.assign(sessionId, chosen.provider);
+		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${state.key}`);
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
 		// on other tiers) are logged but never published over the session's own route.
@@ -371,6 +417,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			skipped: result.skipped,
 			rule: rule?.name,
 			tokens,
+			...(quotaOutcomes.size ? { quota: quotaSummary(quotaOutcomes) } : {}),
 			...(result.compacting ? { compacting: true } : {}),
 			...(lastResort ? { lastResort: true } : {}),
 			...(resilient ? {} : { assigned: true }),
@@ -512,6 +559,11 @@ export default function piTiers(pi: ExtensionAPI): void {
 					return `${candidateKey(c)}:${c.thinking}${reason ? ` [${reason}]` : ""}`;
 				});
 				lines.push(`${name}: ${parts.join(" → ")}`);
+			}
+			if (quota) {
+				const providers = new Set([...cfg.tiers.keys()].flatMap((name) => candidatesFor(cfg, name, rule, expansion(ctx)).map((c) => c.provider)));
+				const outcomes = await quota.read(providers, (p) => ctx.modelRegistry.getApiKeyForProvider(p));
+				lines.push(outcomes.size ? `quota (usable above ${cfg.quota!.minRemainingPercent}% left): ${quotaLine(outcomes)}` : "quota: no readable accounts");
 			}
 			const active = store.active(nowMs);
 			lines.push(active.length ? "cooldowns:" : "cooldowns: none");

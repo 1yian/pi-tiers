@@ -2,7 +2,7 @@
 // End-to-end suite: drives real `pi --mode json` processes with pi-tiers and a scripted fake
 // provider, then checks which model answered, which calls were made, and what was cooled down.
 // Usage: node test/e2e/run.mjs [--keep]   (writes a markdown report to .e2e-<timestamp>/report.md)
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -42,40 +42,63 @@ function makeHome(name) {
 	return dir;
 }
 
-function runPi(home, { model, prompt, plan = {}, classify, cwd = home, env = {}, extra = [] }) {
+function piCommand(home, { model, prompt, plan = {}, classify, cwd = home, env = {}, extra = [] }) {
 	const calls = join(home, "calls.tsv");
-	const before = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0;
-	const res = spawnSync(
-		"pi",
-		[
-			"--mode",
-			"json",
-			"--offline",
-			"--no-skills",
-			"--no-context-files",
-			"--model",
-			model,
-			"-e",
-			EXT,
-			"-e",
-			FAKE,
-			...extra,
-			...(Array.isArray(prompt) ? prompt : [prompt]),
-		],
-		{
-			cwd,
-			encoding: "utf8",
-			timeout: 60_000,
-			env: {
-				...process.env,
-				PI_CODING_AGENT_DIR: home,
-				FAKE_CALLS: calls,
-				FAKE_PLAN: JSON.stringify(plan),
-				FAKE_CLASSIFY: JSON.stringify(classify ?? {}),
-				...env,
-			},
+	const args = [
+		"--mode",
+		"json",
+		"--offline",
+		"--no-skills",
+		"--no-context-files",
+		"--model",
+		model,
+		"-e",
+		EXT,
+		"-e",
+		FAKE,
+		...extra,
+		...(Array.isArray(prompt) ? prompt : [prompt]),
+	];
+	const options = {
+		cwd,
+		encoding: "utf8",
+		timeout: 60_000,
+		env: {
+			...process.env,
+			PI_CODING_AGENT_DIR: home,
+			FAKE_CALLS: calls,
+			FAKE_PLAN: JSON.stringify(plan),
+			FAKE_CLASSIFY: JSON.stringify(classify ?? {}),
+			...env,
 		},
-	);
+	};
+	return { args, options, calls };
+}
+
+function runPi(home, opts) {
+	const { args, options, calls } = piCommand(home, opts);
+	const before = existsSync(calls) ? readFileSync(calls, "utf8").split("\n").filter(Boolean).length : 0;
+	return summarize(home, spawnSync("pi", args, options), calls, before);
+}
+
+/** Starts a Pi without waiting, for scenarios that need several sessions starting together. */
+function runPiAsync(home, opts) {
+	const { args, options, calls } = piCommand(home, opts);
+	return new Promise((resolveRun) => {
+		const child = spawn("pi", args, { cwd: options.cwd, env: options.env, stdio: ["ignore", "pipe", "pipe"], timeout: options.timeout });
+		let stdout = "";
+		let stderr = "";
+		child.stdout.on("data", (d) => {
+			stdout += d;
+		});
+		child.stderr.on("data", (d) => {
+			stderr += d;
+		});
+		child.on("close", (status) => resolveRun(summarize(home, { status, stdout, stderr }, calls, 0)));
+	});
+}
+
+function summarize(home, res, calls, before) {
 	const events = res.stdout
 		.split("\n")
 		.filter(Boolean)
@@ -328,6 +351,18 @@ scenario("the same small-window model is used when the conversation fits", () =>
 	return check(answered(r) === "fake-small/tiny", r);
 });
 
+async function scenarioAsync(name, fn) {
+	let outcome;
+	try {
+		outcome = await fn();
+	} catch (error) {
+		outcome = { ok: false, detail: String(error?.stack ?? error) };
+	}
+	results.push({ name, ...outcome });
+	console.log(`${outcome.ok ? "PASS" : "FAIL"}  ${name}`);
+	if (!outcome.ok) console.log(`      ${JSON.stringify(outcome.evidence ?? outcome.detail).slice(0, 1500)}`);
+}
+
 function withTiers(home, change) {
 	const tiers = JSON.parse(readFileSync(join(home, "tiers.json"), "utf8"));
 	change(tiers);
@@ -439,6 +474,103 @@ scenario("with spread on, sessions start on different accounts of a group", () =
 		{ firsts, expected },
 	);
 });
+
+// ---- Live quota -------------------------------------------------------------------------------
+const quotaPlan = join(OUT, "quota-plan.json");
+const quotaLog = join(OUT, "quota-requests.log");
+const quotaServer = spawn("node", [join(ROOT, "test/e2e/fake-quota-server.mjs"), quotaPlan, quotaLog], { stdio: ["ignore", "pipe", "inherit"] });
+const quotaPort = await new Promise((resolveStart) => quotaServer.stdout.once("data", (d) => resolveStart(Number(String(d).trim()))));
+
+/** Enables live quota for the fake accounts, reading from the fake server. */
+function withQuota(home, quota = {}) {
+	return withTiers(home, (t) => {
+		t.quota = {
+			providers: { "fake-a": "anthropic", "fake-b": "anthropic", "fake-c": "anthropic" },
+			baseUrls: { anthropic: `http://127.0.0.1:${quotaPort}` },
+			...quota,
+		};
+	});
+}
+/** What the fake server reports for each account: percent left in the 5h and 7d windows. */
+function setQuota(plan) {
+	const tokens = Object.fromEntries(Object.entries(plan).map(([provider, spec]) => [`key-${provider}`, spec]));
+	writeFileSync(quotaPlan, JSON.stringify(tokens));
+	writeFileSync(quotaLog, "");
+}
+const quotaRequests = () => readFileSync(quotaLog, "utf8").split("\n").filter(Boolean);
+const quotaRoute = (r) => r.routes.at(-1)?.quota;
+
+scenario("live quota: the account with more room left in its tightest window wins over the first in chain order", () => {
+	setQuota({ "fake-a": { five: 90, seven: 30 }, "fake-b": { five: 50, seven: 80 } });
+	const r = runPi(withQuota(makeHome("quota-room")), { model: "tier/default", prompt: "hello" });
+	const q = quotaRoute(r);
+	const logged = r.custom.some((c) => c.startsWith("tier: quota fake-a 5h 90%, 7d 30% (live); fake-b 5h 50%, 7d 80% (live)") && c.endsWith("chose fake-b/m1"));
+	return check(answered(r) === "fake-b/m1" && q?.["fake-a"]?.source === "live" && logged, r);
+});
+
+scenario(
+	"live quota: an account nearly out is skipped for the next account, and when every account of the entry is nearly out, for the next chain entry",
+	() => {
+		setQuota({ "fake-a": { five: 3, seven: 90 }, "fake-b": { five: 60, seven: 90 } });
+		const next = runPi(withQuota(makeHome("quota-low-account")), { model: "tier/default", prompt: "hello" });
+		setQuota({ "fake-a": { five: 90, seven: 4 }, "fake-b": { five: 2, seven: 90 } });
+		const home = withQuota(makeHome("quota-low-entry"));
+		const entry = runPi(home, { model: "tier/default", prompt: "hello" });
+		// A configured threshold applies: 30% left is no longer enough.
+		setQuota({ "fake-a": { five: 90, seven: 30 }, "fake-b": { five: 50, seven: 80 } });
+		const strict = runPi(withQuota(makeHome("quota-low-config"), { minRemainingPercent: 40 }), { model: "tier/default", prompt: "hello" });
+		const ok = answered(next) === "fake-b/m1" && answered(entry) === "fake-c/m2" && entry.routes.at(-1)?.position === 3 && answered(strict) === "fake-b/m1";
+		return check(ok, { next, entry, strict });
+	},
+);
+
+scenario("live quota: when every candidate is nearly out the session still starts, on the one that frees first", () => {
+	setQuota({ "fake-a": { five: 1, seven: 90 }, "fake-b": { five: 1, seven: 90 } });
+	const home = withQuota(makeHome("quota-all-low"), { providers: { "fake-a": "anthropic", "fake-b": "anthropic", "fake-c": "anthropic" } });
+	withTiers(home, (t) => {
+		t.tiers.default.chain = ["fake/m1:high"];
+	});
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	return check(r.final?.stopReason === "stop", r);
+});
+
+scenario("live quota: a failed fetch falls back to the header-based score and still starts the session", () => {
+	setQuota({ "fake-a": { status: 500 }, "fake-b": { status: 500 } });
+	const home = makeHome("quota-failed");
+	mkdirSync(join(home, "tiers/load"), { recursive: true });
+	// The header-based score still ranks: fake-a is crowded, so fake-b wins.
+	writeFileSync(
+		join(home, "tiers/load/other.json"),
+		JSON.stringify({ pid: process.pid, updatedMs: Date.now(), sessions: { s1: "fake-a", s2: "fake-a" }, usage: [], utilization: {} }),
+	);
+	const r = runPi(withQuota(home), { model: "tier/default", prompt: "hello" });
+	const q = quotaRoute(r);
+	const logged = r.custom.some((c) => c.includes("fake-a unavailable: HTTP 500"));
+	return check(answered(r) === "fake-b/m1" && q?.["fake-a"]?.source === "failed" && logged, r);
+});
+
+scenario("live quota: a hung quota endpoint is cut off at quota.timeoutSeconds and never blocks the start", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90, delayMs: 20_000 }, "fake-b": { five: 90, seven: 90, delayMs: 20_000 } });
+	const started = Date.now();
+	const r = runPi(withQuota(makeHome("quota-timeout"), { timeoutSeconds: 1 }), { model: "tier/default", prompt: "hello" });
+	r.tookMs = Date.now() - started;
+	const q = quotaRoute(r);
+	return check(answered(r) === "fake-a/m1" && q?.["fake-a"]?.source === "timeout" && r.tookMs < 15_000, r);
+});
+
+await scenarioAsync("live quota: parallel starts make one fetch per account and spread across accounts", async () => {
+	setQuota({ "fake-a": { five: 80, seven: 80 }, "fake-b": { five: 80, seven: 80 } });
+	const home = withQuota(makeHome("quota-parallel"));
+	const ids = Array.from({ length: 6 }, (_, i) => `00000000-0000-4000-8000-0000000001${String(i).padStart(2, "0")}`);
+	const runs = await Promise.all(ids.map((id) => runPiAsync(home, { model: "tier/default", prompt: "hello", extra: ["--session-id", id] })));
+	const landed = runs.map(answered);
+	const fetches = quotaRequests();
+	const counts = Object.fromEntries(["key-fake-a", "key-fake-b"].map((t) => [t, fetches.filter((f) => f === t).length]));
+	const ok = landed.every(Boolean) && counts["key-fake-a"] === 1 && counts["key-fake-b"] === 1 && new Set(landed).size === 2;
+	return check(ok, { landed, counts, runs: runs.map((r) => r.stderr) });
+});
+
+quotaServer.kill();
 
 const passed = results.filter((r) => r.ok).length;
 const report = [
