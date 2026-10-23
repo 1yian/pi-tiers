@@ -9,7 +9,12 @@ export const modelKey = (provider: string, model: string) => `model:${provider}/
 export interface CooldownEntry {
 	untilMs: number;
 	reason: string;
+	/** When the mark was set; a live quota reading taken after this can clear it. Absent on marks from older versions. */
+	atMs?: number;
 }
+
+const CLEAR = "clear:";
+const CLEAR_TTL_MS = 8 * 24 * 3600_000;
 
 const REFRESH_MS = 2000;
 
@@ -31,6 +36,15 @@ export class CooldownStore {
 		this.flush(Date.now());
 	}
 
+	/**
+	 * Drops the marks on a key that were set before `nowMs`, for every process: a live reading showed the account has room
+	 * again (a banked reset restores quota before the mark's own reset time). A mark set afterwards still holds.
+	 */
+	clear(key: string, nowMs: number): void {
+		this.set(`${CLEAR}${key}`, { untilMs: nowMs + CLEAR_TTL_MS, reason: "cleared", atMs: nowMs });
+		this.readAtMs = 0;
+	}
+
 	/** The active cooldown for a key across all processes, if any. */
 	get(key: string, nowMs: number): CooldownEntry | undefined {
 		this.refresh(nowMs);
@@ -45,13 +59,13 @@ export class CooldownStore {
 
 	active(nowMs: number): Array<[string, CooldownEntry]> {
 		this.refresh(nowMs);
-		return [...this.merged].filter(([, e]) => e.untilMs > nowMs).sort(([a], [b]) => a.localeCompare(b));
+		return [...this.merged].filter(([key, e]) => !key.startsWith(CLEAR) && e.untilMs > nowMs).sort(([a], [b]) => a.localeCompare(b));
 	}
 
 	private refresh(nowMs: number): void {
 		if (nowMs - this.readAtMs < REFRESH_MS) return;
 		this.readAtMs = nowMs;
-		const merged = new Map<string, CooldownEntry>(this.own);
+		const all: Array<[string, CooldownEntry]> = [...this.own];
 		let names: string[] = [];
 		try {
 			names = readdirSync(this.dir).filter((n) => n.endsWith(".json"));
@@ -70,8 +84,7 @@ export class CooldownStore {
 			for (const [key, e] of Object.entries(entries)) {
 				if (typeof e?.untilMs !== "number" || e.untilMs <= nowMs) continue;
 				live = true;
-				const current = merged.get(key);
-				if (!current || current.untilMs < e.untilMs) merged.set(key, e);
+				all.push([key, e]);
 			}
 			// A file whose entries all expired belongs to nobody useful; its owner rewrites it on the next set.
 			if (!live && path !== this.file) {
@@ -79,6 +92,18 @@ export class CooldownStore {
 					unlinkSync(path);
 				} catch {}
 			}
+		}
+		const clearedAt = new Map<string, number>();
+		for (const [key, e] of all)
+			if (key.startsWith(CLEAR)) clearedAt.set(key.slice(CLEAR.length), Math.max(clearedAt.get(key.slice(CLEAR.length)) ?? 0, e.atMs ?? 0));
+		const merged = new Map<string, CooldownEntry>();
+		for (const [key, e] of all) {
+			if (key.startsWith(CLEAR) || (e.atMs ?? 0) <= (clearedAt.get(key) ?? -1)) {
+				if (key.startsWith(CLEAR)) merged.set(key, e);
+				continue;
+			}
+			const current = merged.get(key);
+			if (!current || current.untilMs < e.untilMs) merged.set(key, e);
 		}
 		this.merged = merged;
 	}

@@ -141,6 +141,14 @@ function summarize(home, res, calls, before) {
 		custom,
 		routes: log.filter((r) => r.event === "route").slice(-3),
 		autos: log.filter((r) => r.event === "auto"),
+		picks: log.filter((r) => r.event === "provider-pick"),
+		jevAsked: existsSync(`${calls}.jev`)
+			? readFileSync(`${calls}.jev`, "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.map((l) => JSON.parse(l))
+			: [],
+		cleared: log.filter((r) => r.event === "cooldown-cleared"),
 		cooldowns: Object.keys(cooldowns).sort(),
 		failures: existsSync(join(home, "tiers/failures.jsonl"))
 			? readFileSync(join(home, "tiers/failures.jsonl"), "utf8")
@@ -628,6 +636,188 @@ scenario("PI_TIERS_AVOID that leaves nothing for the tier fails with one clear l
 		r.final?.stopReason === "error" && r.final.error === "pi-tiers: PI_TIERS_AVOID (fake-c) leaves no provider for tier 'deep'." && r.calls.length === 0,
 		r,
 	);
+});
+
+// ---- Jev provider pick, banked resets, subscriptions before pay-per-token -----------------------
+const JEV = (spec) => ({ FAKE_JEV: JSON.stringify(spec) });
+const rowKeys = (r) => Object.keys(r.jevAsked.at(-1)?.criteria ?? {});
+
+scenario("the classifier picks the provider from the tier's candidate table, and the table, answer, and source are logged", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 }, "fake-c": { five: 70, seven: 70 } });
+	const home = withQuota(makeHome("jev-pick"));
+	mkdirSync(join(home, "tiers/load"), { recursive: true });
+	writeFileSync(
+		join(home, "tiers/load/other.json"),
+		JSON.stringify({ pid: process.pid, updatedMs: Date.now(), sessions: { s1: "fake-b", s2: "fake-b" }, usage: [], utilization: {} }),
+	);
+	const r = runPi(home, { model: "tier/default", prompt: "## Captain's intent\nFix the bug.", env: JEV({ choice: "fake-b/m1" }) });
+	const pick = r.picks[0];
+	const row = pick?.table?.find((t) => t.key === "fake-b/m1");
+	const ok =
+		answered(r) === "fake-b/m1" &&
+		JSON.stringify(rowKeys(r)) === JSON.stringify(["fake-a/m1", "fake-b/m1", "fake-c/m2"]) &&
+		pick.source === "jev" &&
+		pick.answer === "fake-b/m1" &&
+		pick.chosen === "fake-b/m1" &&
+		!pick.fallback &&
+		row?.agents === 2 &&
+		row.windows.some((w) => w.label === "5h" && w.left === 50 && w.resetInMin >= 59) &&
+		r.jevAsked[0].state.task.includes("Fix the bug");
+	return check(ok, r);
+});
+
+scenario("a classifier timeout, an error, and an off-list answer each fall back to the code pick, and a single candidate skips the classifier", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const timeout = withTiers(withQuota(makeHome("jev-timeout")), (t) => {
+		t.auto.providerTimeoutSeconds = 1;
+	});
+	const started = Date.now();
+	const slow = runPi(timeout, { model: "tier/default", prompt: "do it", env: JEV({ delayMs: 20_000, choice: "fake-b/m1" }) });
+	const tookMs = Date.now() - started;
+	const errored = runPi(withQuota(makeHome("jev-error")), { model: "tier/default", prompt: "do it", env: JEV({ error: "upstream 503" }) });
+	const offList = runPi(withQuota(makeHome("jev-off-list")), { model: "tier/default", prompt: "do it", env: JEV({ choice: "nope/m9" }) });
+	const single = runPi(withQuota(makeHome("jev-single")), { model: "tier/deep", prompt: "do it", env: JEV({ choice: "fake-a/m1" }) });
+	const ok =
+		answered(slow) === "fake-a/m1" &&
+		slow.picks[0]?.fallback === "timeout" &&
+		slow.picks[0].source === "code" &&
+		tookMs < 15_000 &&
+		answered(errored) === "fake-a/m1" &&
+		errored.picks[0]?.fallback === "error" &&
+		answered(offList) === "fake-a/m1" &&
+		offList.picks[0]?.fallback === "off-list" &&
+		offList.picks[0].answer === null &&
+		answered(single) === "fake-c/m2" &&
+		single.jevAsked.length === 0 &&
+		single.picks[0]?.fallback === "single";
+	return check(ok, { slow, errored, offList, single });
+});
+
+scenario("a banked reset: live room before the old reset time clears the usage-limit mark at once, and without a live reading the mark holds", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 40, seven: 40 } });
+	const live = withQuota(makeHome("banked-live"));
+	coolFromOtherProcess(live, "account:fake-a", 3600_000);
+	const cleared = runPi(live, { model: "tier/default", prompt: "hello" });
+	const plain = makeHome("banked-plain");
+	coolFromOtherProcess(plain, "account:fake-a", 3600_000);
+	const held = runPi(plain, { model: "tier/default", prompt: "hello" });
+	// A usage-limit mark set after the reading was taken still holds: the reading predates it.
+	setQuota({ "fake-a": { five: 0, seven: 90 }, "fake-b": { five: 40, seven: 40 } });
+	const spent = withQuota(makeHome("banked-spent"));
+	coolFromOtherProcess(spent, "account:fake-a", 3600_000);
+	const stillOut = runPi(spent, { model: "tier/default", prompt: "hello" });
+	const ok =
+		answered(cleared) === "fake-a/m1" &&
+		cleared.cleared[0]?.key === "account:fake-a" &&
+		answered(held) === "fake-b/m1" &&
+		answered(stillOut) === "fake-b/m1" &&
+		stillOut.cleared.length === 0;
+	return check(ok, { cleared, held, stillOut });
+});
+
+scenario("a failed turn whose live check confirms an exhausted window marks the account until the live reset time", () => {
+	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 0, seven: 80 } } });
+	const home = withQuota(makeHome("exhausted-mark"));
+	const before = Date.now();
+	runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
+	const marks = {};
+	for (const f of readdirSync(join(home, "tiers/cooldowns"))) Object.assign(marks, JSON.parse(readFileSync(join(home, "tiers/cooldowns", f), "utf8")));
+	const account = marks["account:fake-a"];
+	const model = marks["model:fake-a/m1"];
+	// The fake endpoint resets an hour from the reading; the 429's own marks are 2m long.
+	const ok = account?.reason === "usage-limit" && account.untilMs - before > 3500_000 && model && model.untilMs - before < 700_000;
+	return check(ok, { marks });
+});
+
+scenario("pay-per-token providers are labelled in the table, ranked last by code, and chosen only when no subscription is usable", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const payg = (home) =>
+		withTiers(home, (t) => {
+			t.payg = ["fake-c"];
+		});
+	const offered = runPi(payg(withQuota(makeHome("payg-offered"))), { model: "tier/default", prompt: "do it", env: JEV({ choice: "fake-c/m2" }) });
+	const labels = Object.fromEntries((offered.picks[0]?.table ?? []).map((t) => [t.key, t.payg]));
+	const described = Object.entries(offered.jevAsked[0]?.criteria ?? {}).map(([k, v]) => [k, v.split(";")[0]]);
+	// Pay-per-token first in the chain, no classifier answer: code still ranks the subscription first.
+	const first = withTiers(payg(withQuota(makeHome("payg-first"))), (t) => {
+		t.tiers.default.chain = ["fake-c/m2:low", "fake/m1:high"];
+	});
+	const ordered = runPi(first, { model: "tier/default", prompt: "do it" });
+	// Every subscription used up: pay-per-token is all that is left, so the classifier is not asked.
+	setQuota({ "fake-a": { five: 2, seven: 90 }, "fake-b": { five: 90, seven: 1 } });
+	const last = runPi(payg(withQuota(makeHome("payg-last"))), { model: "tier/default", prompt: "do it", env: JEV({ first: true }) });
+	const ok =
+		answered(offered) === "fake-c/m2" &&
+		offered.picks[0]?.source === "jev" &&
+		labels["fake-c/m2"] === true &&
+		labels["fake-a/m1"] === false &&
+		JSON.stringify(described) ===
+			JSON.stringify([
+				["fake-a/m1", "subscription"],
+				["fake-b/m1", "subscription"],
+				["fake-c/m2", "PAYG"],
+			]) &&
+		answered(ordered) === "fake-a/m1" &&
+		ordered.picks[0]?.fallback === "error" &&
+		answered(last) === "fake-c/m2" &&
+		last.jevAsked.length === 0;
+	return check(ok, { offered, ordered, last });
+});
+
+scenario("the classifier sees providers from outside the tier's old chain, and can pick one", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const home = withTiers(withQuota(makeHome("jev-wide")), (t) => {
+		// The tier used to name only the fake account group; now it names a model on every provider.
+		t.tiers.quick = { description: "Small chores.", chain: ["fake/m1:low", "fake-c/m2:low", "fake-small/tiny:low"] };
+	});
+	const r = runPi(home, { model: "tier/quick", prompt: "do it", env: JEV({ choice: "fake-small/tiny" }) });
+	const ok =
+		answered(r) === "fake-small/tiny" &&
+		JSON.stringify(rowKeys(r)) === JSON.stringify(["fake-a/m1", "fake-b/m1", "fake-c/m2", "fake-small/tiny"]) &&
+		r.picks[0]?.source === "jev";
+	return check(ok, r);
+});
+
+scenario("the compact tier never calls the classifier, ranks subscriptions before pay-per-token and live quota, and still fails over mid-call", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const payg = (home) =>
+		withTiers(home, (t) => {
+			t.payg = ["fake-c"];
+			t.tiers.compact.chain = ["fake-c/m1:low", "fake/m1:low"];
+		});
+	const ordered = runPi(payg(withQuota(makeHome("compact-payg"))), { model: "tier/compact", prompt: "hello", env: JEV({ first: true }) });
+	setQuota({ "fake-a": { five: 2, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const quotaAware = runPi(withQuota(makeHome("compact-quota")), { model: "tier/compact", prompt: "hello", env: JEV({ first: true }) });
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const failover = runPi(payg(withQuota(makeHome("compact-failover"))), {
+		model: "tier/compact",
+		prompt: "hello",
+		plan: { "fake-a/m1": ["usage"] },
+		env: JEV({ first: true }),
+	});
+	const ok =
+		answered(ordered) === "fake-a/m1" &&
+		answered(quotaAware) === "fake-b/m1" &&
+		answered(failover) === "fake-b/m1" &&
+		failover.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" &&
+		[ordered, quotaAware, failover].every((r) => r.jevAsked.length === 0 && r.picks.length === 0);
+	return check(ok, { ordered, quotaAware, failover });
+});
+
+scenario("PI_TIERS_AVOID and a forced rule still hold against the classifier's answer", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const avoided = runPi(withQuota(makeHome("jev-avoid")), {
+		model: "tier/default",
+		prompt: "do it",
+		env: { ...JEV({ choice: "fake-a/m1" }), PI_TIERS_AVOID: "fake-a" },
+	});
+	const ruled = runPi(withQuota(makeHome("jev-rule")), {
+		model: "tier/default",
+		prompt: "do it",
+		env: { ...JEV({ choice: "fake-a/m1" }), PI_TIERS_RULE: "acme" },
+	});
+	const ok = answered(avoided) === "fake-b/m1" && !rowKeys(avoided).includes("fake-a/m1") && answered(ruled) === "fake-c/m2" && ruled.jevAsked.length === 0;
+	return check(ok, { avoided, ruled });
 });
 
 quotaServer.kill();

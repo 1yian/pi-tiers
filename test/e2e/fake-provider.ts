@@ -133,10 +133,37 @@ export default function (pi: ExtensionAPI) {
 		],
 		classifiers: {
 			"fake-cls-api": {
-				classify: async (model: { provider: string; id: string; api: string }) => {
+				classify: async (
+					model: { provider: string; id: string; api: string },
+					context: { questions: Record<string, { criteria: Record<string, string> }> },
+					options?: { signal?: AbortSignal },
+				) => {
+					const base = { api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() };
+					const asked = context.questions.provider;
+					if (asked) {
+						// The provider pick: FAKE_JEV is {"choice"}, {"error"}, {"delayMs"}, or {"first": true} (the first listed row);
+						// without it the pick errors, so code decides. Rows are logged to $FAKE_CALLS.jev, apart from the call log.
+						const spec = JSON.parse(process.env.FAKE_JEV || '{"error":"no plan"}');
+						appendFileSync(`${process.env.FAKE_CALLS}.jev`, `${JSON.stringify({ criteria: asked.criteria, state: (context as { state?: unknown }).state })}\n`);
+						if (spec.delayMs)
+							await new Promise<void>((resolve) => {
+								const timer = setTimeout(resolve, spec.delayMs);
+								options?.signal?.addEventListener(
+									"abort",
+									() => {
+										clearTimeout(timer);
+										resolve();
+									},
+									{ once: true },
+								);
+							});
+						if (options?.signal?.aborted) return { ...base, answers: {}, stopReason: "aborted", errorMessage: "aborted" };
+						if (spec.error) return { ...base, answers: {}, stopReason: "error", errorMessage: spec.error };
+						const choice = spec.first ? Object.keys(asked.criteria)[0] : spec.choice;
+						return { ...base, stopReason: "stop", answers: { provider: { type: "choice", choice, confidence: 0.9, probabilities: { [choice]: 0.9 } } } };
+					}
 					const spec = JSON.parse(process.env.FAKE_CLASSIFY || '{"choice":"default","confidence":1}');
 					appendFileSync(process.env.FAKE_CALLS!, `classifier\t${spec.choice ?? spec.error}\n`);
-					const base = { api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() };
 					if (spec.error) return { ...base, answers: {}, stopReason: "error", errorMessage: spec.error };
 					return {
 						...base,

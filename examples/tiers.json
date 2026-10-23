@@ -30,5 +30,6 @@
     }
   ],
   "override": "^Model override:\\s*(\\S+)(?:\\s+(\\S+))?",
-  "warnProviders": ["opencode"]
+  "warnProviders": ["opencode"],
+  "payg": ["opencode"]
 }
