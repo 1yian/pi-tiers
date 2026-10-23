@@ -107,7 +107,13 @@ const chat = (id: string, contextWindow = 200_000) => ({
 
 export default function (pi: ExtensionAPI) {
 	for (const provider of ["fake-a", "fake-b", "fake-c"]) {
-		pi.registerProvider(provider, { baseUrl: "https://fake.invalid", apiKey: "fake", api: "fake-api", models: [chat("m1"), chat("m2")], streamSimple: stream });
+		pi.registerProvider(provider, {
+			baseUrl: "https://fake.invalid",
+			apiKey: `key-${provider}`,
+			api: "fake-api",
+			models: [chat("m1"), chat("m2")],
+			streamSimple: stream,
+		});
 	}
 	pi.registerProvider("fake-small", { baseUrl: "https://fake.invalid", apiKey: "fake", api: "fake-api", models: [chat("tiny", 64_000)], streamSimple: stream });
 	pi.registerProvider("fake-cls", {

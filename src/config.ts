@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_QUOTA, type QuotaConfig, type QuotaKind } from "./quota.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type Thinking = (typeof THINKING_LEVELS)[number];
@@ -74,6 +75,8 @@ export interface Config {
 	resilient: Set<string>;
 	/** Start each session on a different member of an account group, chosen from its session id. */
 	spread: boolean;
+	/** Live quota used to choose where a session starts; undefined when `quota` is false. */
+	quota?: QuotaConfig;
 	warnProviders: Set<string>;
 	stateDir: string;
 }
@@ -196,6 +199,32 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 	const resilient = new Set(root.resilient === undefined ? ["compact", "reviewer"].filter((t) => tiers.has(t)) : strArray(root.resilient, "resilient"));
 	for (const t of resilient) if (!tiers.has(t)) fail("resilient", `unknown tier '${t}'`);
 
+	let quota: QuotaConfig | undefined = DEFAULT_QUOTA;
+	if (root.quota === false) quota = undefined;
+	else if (root.quota !== undefined) {
+		const q = obj(root.quota, "quota");
+		const percent = num(q.minRemainingPercent, "quota.minRemainingPercent", DEFAULT_QUOTA.minRemainingPercent);
+		if (percent > 100) fail("quota.minRemainingPercent", "expected a value between 0 and 100");
+		const kinds = new Map<string, QuotaKind>();
+		for (const [provider, kind] of Object.entries(obj(q.providers ?? {}, "quota.providers"))) {
+			if (kind !== "anthropic" && kind !== "codex" && kind !== "xai") fail(`quota.providers.${provider}`, "expected anthropic, codex, or xai");
+			kinds.set(provider, kind as QuotaKind);
+		}
+		const urls = obj(q.baseUrls ?? {}, "quota.baseUrls");
+		const baseUrls: QuotaConfig["baseUrls"] = {};
+		for (const name of ["anthropic", "codex", "xai", "xaiManagement"] as const)
+			if (urls[name] !== undefined) baseUrls[name] = str(urls[name], `quota.baseUrls.${name}`);
+		const xai = obj(q.xai ?? {}, "quota.xai");
+		quota = {
+			minRemainingPercent: percent,
+			timeoutMs: num(q.timeoutSeconds, "quota.timeoutSeconds", DEFAULT_QUOTA.timeoutMs / 1000) * 1000,
+			cacheSeconds: num(q.cacheSeconds, "quota.cacheSeconds", DEFAULT_QUOTA.cacheSeconds),
+			kinds,
+			baseUrls,
+			xaiReferenceUsd: num(xai.referenceUsd, "quota.xai.referenceUsd", DEFAULT_QUOTA.xaiReferenceUsd) || DEFAULT_QUOTA.xaiReferenceUsd,
+		};
+	}
+
 	return {
 		path,
 		accounts,
@@ -207,6 +236,7 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		background,
 		resilient,
 		spread: root.spread === true,
+		quota,
 		warnProviders: new Set(root.warnProviders === undefined ? [] : strArray(root.warnProviders, "warnProviders")),
 		stateDir: root.stateDir === undefined ? join(agentDir, "tiers") : expandHome(str(root.stateDir, "stateDir")),
 	};

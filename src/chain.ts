@@ -48,7 +48,7 @@ function rotated<T>(list: readonly T[], by: number): T[] {
 	return [...list.slice(start), ...list.slice(0, start)];
 }
 
-export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "context-too-small";
+export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "quota-low" | "context-too-small";
 
 export interface PickInput {
 	candidates: Candidate[];
@@ -96,7 +96,16 @@ export interface AssignInput {
 	/** When the candidate's known cooldown ends (ms); only used when every usable candidate is cooling. */
 	freeAt: (c: Candidate) => number;
 	contextWindow: (c: Candidate) => number;
+	/** Live room left (0..100) in the candidate's tightest window, when known. */
+	room?: (c: Candidate) => number | undefined;
+	/** Live load without the header-based quota guess (agents and recent tokens), used with `room`. */
+	load?: (c: Candidate) => number;
+	/** Breaks exact ties differently per session, so sessions starting together spread out. */
+	seed?: number;
 }
+
+/** Rooms within this many points of each other count as equal, so load decides between near-equal accounts. */
+export const ROOM_BAND = 10;
 
 /**
  * Chooses the one candidate a session commits to. The chain is a preference order of models: the
@@ -104,7 +113,7 @@ export interface AssignInput {
  * is evidence the account is exhausted, so it ranks a candidate last but never removes it, because
  * a stale or wrong cooldown must not leave the session without a model.
  */
-export function assign({ candidates, check, score, freeAt, contextWindow }: AssignInput): PickResult {
+export function assign({ candidates, check, score, freeAt, contextWindow, room, load, seed }: AssignInput): PickResult {
 	const skipped: PickResult["skipped"] = [];
 	const ready: Candidate[] = [];
 	const cooling: Candidate[] = [];
@@ -112,7 +121,7 @@ export function assign({ candidates, check, score, freeAt, contextWindow }: Assi
 	for (const c of candidates) {
 		const reason = check(c);
 		if (!reason) ready.push(c);
-		else if (reason === "cooling") cooling.push(c);
+		else if (reason === "cooling" || reason === "quota-low") cooling.push(c);
 		else {
 			skipped.push({ key: candidateKey(c), reason });
 			if (reason === "context-too-small") tooSmall.push(c);
@@ -121,8 +130,17 @@ export function assign({ candidates, check, score, freeAt, contextWindow }: Assi
 	const byOrder = (a: Candidate, b: Candidate) => (a.group ?? 0) - (b.group ?? 0) || a.position - b.position;
 	if (ready.length) {
 		const first = Math.min(...ready.map((c) => c.group ?? 0));
-		const best = ready.filter((c) => (c.group ?? 0) === first).sort((a, b) => score(a) - score(b) || a.position - b.position)[0];
-		return { chosen: best, skipped };
+		const group = ready.filter((c) => (c.group ?? 0) === first);
+		// With a live reading for every account of the group, the most room left wins, then the least load;
+		// otherwise the header-based score decides as before.
+		const rooms = room && load ? group.map((c) => room(c)) : [];
+		if (room && load && rooms.length && rooms.every((r) => r !== undefined)) {
+			const key = (c: Candidate) => [-Math.floor(room(c)! / ROOM_BAND), load(c)] as const;
+			const ranked = [...group].sort((a, b) => key(a)[0] - key(b)[0] || key(a)[1] - key(b)[1] || a.position - b.position);
+			const tied = ranked.filter((c) => key(c)[0] === key(ranked[0])[0] && key(c)[1] === key(ranked[0])[1]);
+			return { chosen: tied[(seed ?? 0) % tied.length], skipped };
+		}
+		return { chosen: group.sort((a, b) => score(a) - score(b) || a.position - b.position)[0], skipped };
 	}
 	if (cooling.length) {
 		const best = [...cooling].sort((a, b) => freeAt(a) - freeAt(b) || byOrder(a, b))[0];
