@@ -23,24 +23,31 @@ export function lastUserText(messages: readonly Message[]): string {
 	return messageText([...messages].reverse().find((m) => m.role === "user"));
 }
 
-/** The configured sections of `text` (heading line through the next heading of the same or higher level), or all of it. */
+/**
+ * The configured sections of `text`, or all of it. A `#` heading runs through the next heading of the same or
+ * higher level. A plain label such as "Spec:" (which may end a longer line, like a `[fleet] ... Captain's
+ * intent:` header) runs through the line before the next configured label, or to the end.
+ */
 export function extractSections(text: string, headings: string[], maxChars: number): string {
 	if (headings.length === 0) return text.slice(0, maxChars);
 	const lines = text.split("\n");
 	const picked: string[] = [];
 	for (const heading of headings) {
-		const start = lines.findIndex((l) => l.trim() === heading.trim());
+		const h = heading.trim();
+		const level = /^#+/.exec(h)?.[0].length ?? 0;
+		const others = headings.map((o) => o.trim()).filter((o) => o !== h);
+		const start = lines.findIndex((l) => (level > 0 ? l.trim() === h : l.trim().endsWith(h)));
 		if (start < 0) continue;
-		const level = /^#+/.exec(heading.trim())?.[0].length ?? 0;
 		let end = lines.length;
 		for (let i = start + 1; i < lines.length; i++) {
 			const m = /^(#+)\s/.exec(lines[i]);
-			if (m && (level === 0 || m[1].length <= level)) {
+			if (level > 0 ? m && m[1].length <= level : others.some((o) => lines[i].trim().startsWith(o))) {
 				end = i;
 				break;
 			}
 		}
-		picked.push(lines.slice(start, end).join("\n"));
+		const first = level > 0 ? lines[start] : lines[start].slice(lines[start].lastIndexOf(h));
+		picked.push([first, ...lines.slice(start + 1, end)].join("\n"));
 	}
 	return (picked.length ? picked.join("\n\n") : text).slice(0, maxChars);
 }
@@ -70,6 +77,8 @@ export async function decideTier(config: Config, auto: AutoConfig, text: string,
 		return { tier: auto.fallback, fallback: "error", detail: result.errorMessage ?? "unexpected classifier answer" };
 	}
 	if (answer.confidence < auto.minConfidence) {
+		// Unsure but above the floor: the classifier's own top pick beats the fallback.
+		if (answer.confidence >= auto.floor) return { tier: answer.choice, confidence: answer.confidence, detail: "below minConfidence, above floor" };
 		return { tier: auto.fallback, fallback: "low-confidence", confidence: answer.confidence, detail: `picked ${answer.choice}` };
 	}
 	return { tier: answer.choice, confidence: answer.confidence };
