@@ -37,6 +37,8 @@ export interface AutoConfig {
 	tiers: string[];
 	fallback: string;
 	minConfidence: number;
+	/** Below minConfidence but at or above this, the classifier's top pick is used instead of the fallback. Defaults to minConfidence (off). */
+	floor: number;
 	/** Markdown headings whose sections are sent instead of the whole message, when present. */
 	sections: string[];
 	maxChars: number;
@@ -144,12 +146,15 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		if (!tiers.has(fallback)) fail("auto.fallback", `unknown tier '${fallback}'`);
 		const minConfidence = num(a.minConfidence, "auto.minConfidence", 0.6);
 		if (minConfidence > 1) fail("auto.minConfidence", "expected a value between 0 and 1");
+		const floor = num(a.floor, "auto.floor", minConfidence);
+		if (floor > minConfidence) fail("auto.floor", "expected a value at most auto.minConfidence");
 		auto = {
 			classifierProvider,
 			classifierModel: rest.join("/"),
 			tiers: autoTiers,
 			fallback,
 			minConfidence,
+			floor,
 			sections: a.sections === undefined ? [] : strArray(a.sections, "auto.sections"),
 			maxChars: num(a.maxChars, "auto.maxChars", 12000),
 			providerTimeoutMs: num(a.providerTimeoutSeconds, "auto.providerTimeoutSeconds", 3) * 1000,

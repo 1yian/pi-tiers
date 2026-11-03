@@ -38,10 +38,10 @@ See [`examples/tiers.json`](examples/tiers.json).
 | `tiers.<name>.chain` | Ordered `provider/model:thinking` entries. Thinking defaults to `medium`. |
 | `tiers.<name>.description` | What belongs in the tier. Required for tiers `auto` can pick; the classifier sees these descriptions. |
 | `auto.classifier` | `provider/model` of a Pi classifier model. |
-| `auto.tiers`, `auto.fallback`, `auto.minConfidence` | Tiers it may pick, the tier used when it is unsure or unavailable, and the confidence floor (default 0.6). |
+| `auto.tiers`, `auto.fallback`, `auto.minConfidence` | Tiers it may pick, the tier used when it is unsure or unavailable, and the confidence needed to use its pick (default 0.6). `auto.floor` (default: same as `minConfidence`) lets a pick between the two stand instead of the fallback. |
 | `auto.providerTimeoutSeconds` | How long the classifier's provider pick may take before code picks (default 3). |
 | `payg` | Pay-per-token providers (for example `baseten`), labelled PAYG for the classifier and ranked last by code. |
-| `auto.sections`, `auto.maxChars` | Markdown headings whose sections are classified instead of the whole message, and a length cap. |
+| `auto.sections`, `auto.maxChars` | Headings whose sections are classified instead of the whole message, and a length cap. A `#` heading runs to the next heading of its level; a plain label such as `Spec:` (also matched at the end of a line) runs to the next configured label or the end. |
 | `rules[]` | `name`, `match.gitRemote` (regex) and/or `match.cwdPrefix`. `tiers` replaces chains in that context; `allowProviders` filters the other chains and blocks overrides to other providers. Set `PI_TIERS_RULE=<name>` to force a rule regardless of directory. |
 | `override` | Regex for an explicit model line in the first message, e.g. `Model override: anthropic/claude-opus-5-5 max`. Group 1 is `provider/model`, group 2 the thinking level. |
 | `warnProviders` | Providers flagged as last resorts in the status line. |
