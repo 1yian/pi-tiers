@@ -1,6 +1,7 @@
 // pi-tiers: work tiers as virtual models. Every tier commits a session to one model from an ordered chain.
-// A failed call is retried on that model by Pi's own backoff (settings `retry`); only a failure whose live
-// quota check confirms an exhausted account moves the session to another provider. `tier/auto` picks the tier with a classifier.
+// A failed call is retried on that model by Pi's own backoff (settings `retry`). Two things move off it: a failure whose
+// live quota check confirms an exhausted account moves the session to another provider, and repeated connection
+// failures move the rest of the run to the next service in the chain. `tier/auto` picks the tier with a classifier.
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -34,6 +35,9 @@ const ENTRY = "pi-tiers";
 const CONTEXT_HEADROOM = 16_000;
 /** Continuations the extension may request in one run after a request failed outright. */
 const MAX_CONTINUES = 4;
+/** Consecutive connection failures (no HTTP response) a model gets within a run before the run leaves its service. Pi's retry
+ * budget is shared by every model of the run, so the default five retries cover three services at two attempts each. */
+const TRANSIENT_ATTEMPTS = 2;
 /** Weights of a provider's load when choosing where a session starts. These are heuristics, not measurements:
  * quota already used (0..1) outweighs a whole agent, and 500K recent tokens count as one agent. */
 const UTILIZATION_WEIGHT = 10;
@@ -95,6 +99,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 	let exhausted: { line: string; original: string; next?: string } | undefined;
 	/** Sessions (and tiers) whose account just proved exhausted: their next request picks again instead of staying put. */
 	const leaving = new Set<string>();
+	// Services (an account group, or a provider outside any group) whose connection failed TRANSIENT_ATTEMPTS times in a row
+	// since the last user message. The run leaves them and goes back to its own model on the next user message.
+	const failedServices = new Set<string>();
+	/** The model the run moved to; its remaining requests stay there so the classifier is asked once. */
+	let runModel: string | undefined;
+	let transientStreak: { key: string; count: number } | undefined;
 	// Size of the most recent request, for choosing a model to continue a failed run on.
 	let lastTokens = 0;
 	let continues = 0;
@@ -193,6 +203,11 @@ export default function piTiers(pi: ExtensionAPI): void {
 	/** Whether live quota covers this provider, so a text-classified cooldown is not needed for it. */
 	const live = (provider: string): boolean => Boolean(cfg.quota && kindOf(provider, cfg.quota));
 
+	// Accounts of one group are one service: when it cannot be reached, its other accounts cannot be either.
+	const serviceByProvider = new Map<string, string>();
+	for (const [group, members] of cfg.accounts) for (const member of members) serviceByProvider.set(member, group);
+	const serviceOf = (provider: string) => serviceByProvider.get(provider) ?? provider;
+
 	const windowOf = (ctx: ExtensionContext) => (c: Candidate) => ctx.modelRegistry.find(c.provider, c.model)?.contextWindow ?? 0;
 
 	const isBackground = () => process.env.PI_TIERS_BACKGROUND === "1";
@@ -238,6 +253,28 @@ export default function piTiers(pi: ExtensionAPI): void {
 		return failure;
 	};
 
+	// Pi retries the first connection failure on the same model, where the prompt cache is warm. The next one in a row takes the
+	// model's whole service out of the run, so the retry after it goes to the next service in the chain. Every retried failure is
+	// logged with its text and duration, which Pi's own transcript does not keep for a turn that recovered.
+	const noteRetry = (failed: NonNullable<ModelRouteRequest["failed"]>) => {
+		const key = `${failed.model.provider}/${failed.model.id}`;
+		const message = failed.message.errorMessage ?? "";
+		const transient = isTransient(message, undefined);
+		transientStreak = transient ? { key, count: transientStreak?.key === key ? transientStreak.count + 1 : 1 } : undefined;
+		log({
+			event: "retry-failure",
+			key,
+			transient,
+			...(transientStreak ? { streak: transientStreak.count } : {}),
+			durationMs: failed.message.durationMs,
+			error: message.slice(0, 300),
+		});
+		if (transientStreak && transientStreak.count >= TRANSIENT_ATTEMPTS) {
+			failedServices.add(serviceOf(failed.model.provider));
+			transientStreak = undefined;
+		}
+	};
+
 	// A failure that ends a run is written where Fleet can read it, with the provider's own words and
 	// reset time, whether or not this tier recovers by itself.
 	const surfaceFailure = (failed: AssistantMessage, tier: string | undefined, recovery: "none" | "pool", ctx: ExtensionContext): void => {
@@ -280,7 +317,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (recovery === "none" && !exhausted) {
 			const when = record.resetAt ? `; resets ${record.resetAt}` : record.retryAfter ? `; retry-after ${record.retryAfter}s` : "";
 			pi.appendEntry<EntryData>(ENTRY, {
-				text: `pi-tiers: ${key} failed (${record.kind}${record.status ? ` ${record.status}` : ""}${when}): ${message.slice(0, 300)}. Not switching models; waiting for recovery.`,
+				text: `pi-tiers: ${key} failed (${record.kind}${record.status ? ` ${record.status}` : ""}${when}): ${message.slice(0, 300)}. ${
+					failedServices.size ? `Left after repeated connection failures: ${[...failedServices].join(", ")}.` : "Not switching models; waiting for recovery."
+				}`,
 			});
 		}
 	};
@@ -333,9 +372,17 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const previous = req.state ?? {};
 		const state: TierState = { ...previous };
 
-		// Pi retries a failed call on the same model with backoff; a provider without a live reader keeps a text-classified mark.
-		if (req.reason === "retry" && req.failed)
+		// A user message starts a new run: every service is tried again and the session is back on its own model.
+		if (req.reason === "user") {
+			failedServices.clear();
+			runModel = undefined;
+			transientStreak = undefined;
+		}
+		// Pi retries a failed call with backoff; a provider without a live reader keeps a text-classified mark.
+		if (req.reason === "retry" && req.failed) {
 			noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx, { transientCools: false });
+			noteRetry(req.failed);
+		}
 
 		let tier = selected;
 		if (selected === AUTO) {
@@ -369,8 +416,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
-		// Stay on the model that last served this session and tier. It is left only when live quota confirmed the
-		// account exhausted (after a failed turn, or at a direct request's pick time); whatever else happens to it, the session keeps it.
+		// A service that failed to connect twice in a row is left for the rest of the run, for every request including direct ones
+		// (a compaction summary sent to a service this run cannot reach would only fail). When every service failed there is nowhere to
+		// go, and the run keeps retrying where it is.
+		const reachable = failedServices.size ? candidates.filter((c) => !failedServices.has(serviceOf(c.provider))) : candidates;
+		const moved = reachable.length > 0 && reachable.length < candidates.length;
+		if (moved) candidates = reachable;
+		// Stay on the model that last served this session and tier. It is left when live quota confirmed the account exhausted
+		// (after a failed turn, or at a direct request's pick time) and, for the rest of one run, when its service cannot be reached.
 		const sessionId = ctx.sessionManager.getSessionId();
 		const servedKey = `${sessionId}\0${tier}`;
 		// A session this process has not routed yet is starting here, even when its file already holds a committed
@@ -379,6 +432,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		let sticky = routedSessions.has(sessionId)
 			? (state.key ?? served.get(servedKey) ?? (req.previous ? `${req.previous.model.provider}/${req.previous.model.id}` : undefined))
 			: undefined;
+		if (moved && req.reason !== "direct" && runModel && candidates.some((c) => candidateKey(c) === runModel)) sticky = runModel;
 		// A failed turn confirmed this account exhausted. A direct request (compaction, an extension call) has no failed turn
 		// to confirm anything, so its pick checks the live quota of the model it would stay on.
 		let departed = leaving.delete(servedKey);
@@ -468,12 +522,24 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 		const chosen = result.chosen;
 		const model = ctx.modelRegistry.find(chosen.provider, chosen.model)!;
-		state.key = candidateKey(chosen);
-		served.set(servedKey, state.key);
+		const chosenKey = candidateKey(chosen);
+		if (moved) {
+			// The run is off its own model. The session keeps that model (state and sticky memory untouched), so the next user message starts there again.
+			if (req.reason !== "direct") {
+				if (runModel !== chosenKey)
+					pending.push(
+						`tier: ${[...failedServices].join(", ")} could not be reached after ${TRANSIENT_ATTEMPTS} connection failures; this run continues on ${chosenKey}`,
+					);
+				runModel = chosenKey;
+			}
+		} else {
+			state.key = chosenKey;
+			served.set(servedKey, chosenKey);
+		}
 		routedSessions.add(sessionId);
-		lastRouteKey = state.key;
+		lastRouteKey = chosenKey;
 		if (req.reason !== "direct") load.assign(sessionId, chosen.provider);
-		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${state.key}`);
+		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${chosenKey}`);
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
 		// on other tiers) are logged but never published over the session's own route.
@@ -495,7 +561,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			selected,
 			tier,
 			reason: req.reason,
-			chosen: state.key,
+			chosen: chosenKey,
 			position: chosen.position,
 			skipped: result.skipped,
 			rule: rule?.name,
@@ -503,6 +569,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			...(quotaOutcomes.size ? { quota: quotaSummary(quotaOutcomes) } : {}),
 			...(result.compacting ? { compacting: true } : {}),
 			...(departed ? { departed: true } : {}),
+			...(moved ? { left: [...failedServices] } : {}),
 		});
 
 		const changed = JSON.stringify(state) !== JSON.stringify(previous);
@@ -563,6 +630,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (event.message.role !== "assistant") return;
 		lastAssistant = event.message as AssistantMessage;
 		const usage = lastAssistant.usage;
+		if (lastAssistant.stopReason !== "error") transientStreak = undefined;
 		if (lastAssistant.stopReason !== "error" && usage)
 			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });

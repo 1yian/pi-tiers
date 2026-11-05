@@ -147,6 +147,7 @@ function summarize(home, res, calls, before) {
 					.map((l) => JSON.parse(l))
 			: [],
 		cleared: log.filter((r) => r.event === "cooldown-cleared"),
+		retryFailures: log.filter((r) => r.event === "retry-failure"),
 		cooldowns: Object.keys(cooldowns).sort(),
 		failures: existsSync(join(home, "tiers/failures.jsonl"))
 			? readFileSync(join(home, "tiers/failures.jsonl"), "utf8")
@@ -385,14 +386,61 @@ scenario("a timeout is retried on the same account, where the prompt cache is, i
 	return check(answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:timeout,fake-a/m1:ok" && r.cooldowns.length === 0, r);
 });
 
-scenario("a dropped connection stays on the assigned account once Pi's retries run out, and is surfaced", () => {
-	const r = runPi(makeHome("connection"), {
+scenario("two dropped connections in a row move the run to the next service in the chain, not to the first service's other account", () => {
+	const home = makeHome("connection-failover");
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["connection", "connection"] } });
+	const ok =
+		answered(r) === "fake-c/m2" &&
+		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-c/m2:ok" &&
+		r.cooldowns.length === 0 &&
+		r.retryFailures.map((f) => `${f.key}:${f.streak}`).join() === "fake-a/m1:1,fake-a/m1:2" &&
+		r.custom.some((c) => c.startsWith("tier: fake could not be reached after 2 connection failures; this run continues on fake-c/m2"));
+	return check(ok, r);
+});
+
+scenario("the next user message goes back to the session's own model after a run moved off it", () => {
+	const r = runPi(makeHome("connection-return"), {
+		model: "tier/default",
+		prompt: ["first", "second"],
+		plan: { "fake-a/m1": ["connection", "connection"] },
+	});
+	const ok = answered(r) === "fake-a/m1" && r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-c/m2:ok,fake-a/m1:ok";
+	return check(ok, r);
+});
+
+scenario("when the next service drops the connection too, the failure is surfaced after Pi's retries and names the service the run left", () => {
+	const home = withTiers(makeHome("connection-all"), (t) => {
+		t.tiers.default.chain = ["fake/m1:high", "fake-c/m1:low"];
+	});
+	const r = runPi(home, {
 		model: "tier/default",
 		prompt: "hello",
-		plan: { "fake-a/m1": ["connection", "connection", "connection", "connection"] },
+		plan: { "fake-a/m1": ["connection", "connection"], "fake-c/m1": ["connection", "connection"] },
 	});
-	const ok = r.final?.stopReason === "error" && r.calls.length === 4 && r.calls.every((c) => c === "fake-a/m1:connection") && r.failures.length === 1;
+	const ok =
+		r.final?.stopReason === "error" &&
+		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-c/m1:connection,fake-c/m1:connection" &&
+		r.failures.length === 1 &&
+		r.custom.some((c) => c.includes("Left after repeated connection failures: fake."));
 	return check(ok, r);
+});
+
+scenario("a request outside the agent loop avoids a service the run could not reach", () => {
+	const home = makeHome("connection-direct");
+	const out = join(home, "direct.json");
+	const r = runPi(home, {
+		model: "tier/default",
+		prompt: ["hello", "/direct-probe compact"],
+		plan: { "fake-a/m1": ["connection", "connection"] },
+		env: { DIRECT_OUT: out },
+		extra: ["-e", DIRECT],
+	});
+	const { results = [] } = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
+	r.direct = results;
+	return check(
+		r.calls.join() === "fake-a/m1:connection,fake-a/m1:connection,fake-c/m2:ok,fake-c/m2:ok,fake-c/m2:ok" && results.join() === "fake-c/m2:stop,fake-c/m2:stop",
+		r,
+	);
 });
 
 scenario("background work never uses an account kept for the user", () => {
