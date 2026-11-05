@@ -22,7 +22,8 @@ const AUTH = /\b401\b|unauthori[sz]ed|invalid.?(?:api.?)?key|authentication|not 
 const FORBIDDEN = /\b403\b|forbidden|access is disabled|not allowed|FreeTierError|permission/i;
 const RATE = /\b429\b|rate.?limit|too many requests|resource.?exhausted/i;
 const SERVER = /overloaded|\b5\d\d\b|server.?error|internal.?error|unavailable|at capacity/i;
-const NETWORK = /timed? ?out|timeout|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up|connection error|network/i;
+const NETWORK =
+	/timed? ?out|timeout|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ENOTFOUND|EAI_AGAIN|getaddrinfo|fetch failed|socket hang up|socket connection was closed|other side closed|connection (?:error|lost|refused)|network|terminated/i;
 
 /**
  * A request that never got an HTTP error back: a timeout or a dropped connection. It says nothing about
