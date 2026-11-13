@@ -8,7 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const EXT = join(ROOT, "src/index.ts");
+const EXT = process.env.E2E_ROUTER_PATH ?? join(ROOT, "src/index.ts");
 const FAKE = join(ROOT, "test/e2e/fake-provider.ts");
 const DIRECT = join(ROOT, "test/e2e/direct-probe.ts");
 const OUT = join(ROOT, `.e2e-${new Date().toISOString().replace(/[:.]/g, "-")}`);
@@ -224,16 +224,19 @@ scenario("a new session avoids an account another process recorded as cooling", 
 	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-b/m1:ok", r);
 });
 
-scenario("a non-retryable usage limit ends the run on the assigned account and is surfaced, with no continuation", () => {
+scenario("a non-retryable usage limit continues on the next subscription", () => {
 	const r = runPi(makeHome("usage"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
 	const ok =
-		r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.kind === "usage-limit" && r.failures[0].recovery === "none";
+		answered(r) === "fake-b/m1" &&
+		r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" &&
+		r.failures[0]?.kind === "usage-limit" &&
+		r.failures[0].recovery === "pool";
 	return check(ok, r);
 });
 
-scenario("the compact tier follows the same flow as every tier: an error that is not a confirmed quota exhaustion is surfaced, with no switch", () => {
+scenario("a normal turn on the compact tier recovers from an explicit usage denial without quota confirmation", () => {
 	const r = runPi(makeHome("pool-usage"), { model: "tier/compact", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
-	const ok = r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.recovery === "none";
+	const ok = answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" && r.failures[0]?.recovery === "pool";
 	return check(ok, r);
 });
 
@@ -339,7 +342,7 @@ scenario("a model whose context window is too small is skipped", () => {
 	return check(answered(r) === "fake-c/m2" && skipped, r);
 });
 
-scenario("when every usable rung is too small, the largest one is used and Pi compacts instead of the request failing", () => {
+scenario("when every rung is too small, routing refuses instead of sending an oversized request", () => {
 	// Two ~37K-token turns outgrow the only model's 64K window on the second turn.
 	const home = makeHome("compact-fallback");
 	const prompts = [`Remember: ${"lorem ipsum dolor sit amet ".repeat(5500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(5500)}`];
@@ -347,7 +350,10 @@ scenario("when every usable rung is too small, the largest one is used and Pi co
 	const compaction = sessionEntries(home).find((e) => e.type === "compaction");
 	r.compaction = compaction && { tokensBefore: compaction.tokensBefore };
 	const routed = r.routes.some((x) => x.chosen === "fake-small/tiny" && x.compacting && x.reason === "user");
-	return check(routed && compaction && r.final?.stopReason === "stop", r);
+	return check(
+		!routed && !compaction && r.final?.stopReason === "error" && r.calls.join() === "fake-small/tiny:ok" && r.final.error.includes("context-too-small"),
+		r,
+	);
 });
 
 scenario("the same small-window model is used when the conversation fits", () => {
@@ -468,7 +474,7 @@ scenario("a tier whose only rung is cooling still uses it rather than failing to
 	return check(answered(r) === "fake-c/m1" && r.calls.join() === "fake-c/m1:ok", r);
 });
 
-scenario("compaction-style direct requests on the compact tier keep working when every rung is cooling", () => {
+scenario("direct requests stop safely when every account is cooling", () => {
 	const home = makeHome("compact-cooling");
 	coolFromOtherProcess(home, "account:fake-a", 120_000);
 	coolFromOtherProcess(home, "account:fake-b", 30_000, "999998");
@@ -477,7 +483,7 @@ scenario("compaction-style direct requests on the compact tier keep working when
 	const r = runPi(home, { model: "tier/default", prompt: "/direct-probe compact", env: { DIRECT_OUT: out }, extra: ["-e", DIRECT] });
 	const { results = [] } = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
 	r.direct = results;
-	return check(results.length === 2 && results.every((x) => x === "fake-b/m1:stop"), r);
+	return check(results.join() === "tier/compact:error,tier/compact:error" && r.calls.length === 0, r);
 });
 
 scenario("with spread on, sessions start on different accounts of a group", () => {
@@ -616,7 +622,7 @@ scenario("(d) every provider used up: the failed turn ends with exactly one line
 	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { five: 90, seven: 2 } }, "fake-b": USED_UP, "fake-c": USED_UP });
 	const sevenD = runPi(withQuota(makeHome("exhausted-7d")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["429", "429", "429", "429"] } });
 	const ok =
-		fiveH.final?.error === EXHAUSTED("fake-a", "5h") &&
+		fiveH.final?.error === "pi-tiers: fake-a failed; no allowed subscription can continue." &&
 		sevenD.final?.error === EXHAUSTED("fake-a", "7d") &&
 		fiveH.calls.join() === "fake-a/m1:usage" &&
 		sevenD.calls.length === 1 &&
@@ -625,12 +631,12 @@ scenario("(d) every provider used up: the failed turn ends with exactly one line
 	return check(ok, { fiveH, sevenD });
 });
 
-scenario("a failed turn with quota left, or a failed quota read, keeps the provider's own error and prints nothing extra", () => {
+scenario("an explicit usage denial overrides healthy or unreadable auxiliary quota", () => {
 	setQuota({ "fake-a": { five: 80, seven: 80 } });
 	const left = runPi(withQuota(makeHome("exhausted-no")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
 	setQuota({ "fake-a": { five: 80, seven: 80, after: 1, later: { status: 500 } } });
 	const unreadable = runPi(withQuota(makeHome("exhausted-unreadable")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
-	const own = (r) => r.final?.error?.includes("FreeUsageLimitError") && r.custom.some((c) => c.includes("Not switching models"));
+	const own = (r) => answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok";
 	return check(own(left) && own(unreadable) && !visible(left).some((t) => t?.includes("quota has exhausted")), { left, unreadable });
 });
 
@@ -776,8 +782,8 @@ scenario("pay-per-token providers are labelled in the table, ranked last by code
 			]) &&
 		answered(ordered) === "fake-a/m1" &&
 		ordered.picks[0]?.fallback === "error" &&
-		answered(last) === "fake-c/m2" &&
-		last.jevAsked.length === 0;
+		answered(last) === "fake-a/m1" &&
+		last.jevAsked.length === 1;
 	return check(ok, { offered, ordered, last });
 });
 
@@ -884,7 +890,7 @@ scenario("(c) confirmed quota exhaustion mid-turn skips the retries, repicks (cl
 		marks["account:fake-a"]?.reason === "usage-limit" &&
 		r.picks.at(-1)?.source === "jev" &&
 		Object.keys(asked?.criteria ?? {}).join() === "fake-b/m1,fake-c/m2" &&
-		r.custom.some((c) => c.includes("continuing the interrupted turn on another provider")) &&
+		r.custom.some((c) => c.includes("recovering the interrupted turn")) &&
 		r.failures[0]?.recovery === "pool";
 	return check(ok, { ...r, marks });
 });
@@ -941,14 +947,169 @@ scenario("(f) a compactor's direct request leaves an account whose live quota is
 	return check(ok, { stays: results("direct-healthy"), leaves: results("direct-exhausted"), staysRun: stays, leavesRun: leaves });
 });
 
-scenario("(b) a failure with quota left never repicks, even when another account has more room", () => {
+scenario("(b) an explicit usage denial reroutes even when the quota reader claims room", () => {
 	setQuota({ "fake-a": { five: 20, seven: 90 }, "fake-b": { five: 99, seven: 99 } });
 	const home = withTiers(withQuota(makeHome("no-repick", BACKOFF)), (t) => {
 		t.tiers.default.chain = ["fake-a/m1:high", "fake-b/m1:high"];
 	});
 	// Chain order puts fake-a first and the single-account entries are not grouped, so the session starts on fake-a.
 	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["usage"] } });
-	return check(r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:usage" && r.failures[0]?.recovery === "none", r);
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:usage,fake-b/m1:ok" && r.failures[0]?.recovery === "pool", r);
+});
+
+scenario("actual manual compaction persists a checkpoint with the real session compactor", () => {
+	const home = makeHome("actual-compaction");
+	const out = join(home, "compaction.json");
+	const r = runPi(home, {
+		model: "tier/default",
+		prompt: [`Remember: ${"lorem ipsum dolor sit amet ".repeat(5500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(5500)}`, "/compact-probe"],
+		plan: process.env.E2E_COMPACTION_BILLING ? { "fake-a/m1": ["ok", "ok", "billing"] } : {},
+		env: { COMPACT_OUT: out },
+		extra: ["-e", join(ROOT, "test/e2e/compact-probe.ts")],
+	});
+	const result = existsSync(out) ? JSON.parse(readFileSync(out, "utf8")) : {};
+	const checkpoint = sessionEntries(home).find((entry) => entry.type === "compaction");
+	return check(result.ok === true && checkpoint?.summary.includes("OK from fake-a/m1"), { ...r, compactionResult: result, checkpoint });
+});
+
+scenario("billing failover: exact xAI credits denial completes on another subscription without quota confirmation", () => {
+	const home = withTiers(makeHome("billing-exact"), (t) => {
+		t.tiers.default.chain = ["xai/m1:low", "fake-a/m1:low"];
+	});
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "xai/m1": ["billing"] } });
+	return check(
+		answered(r) === "fake-a/m1" &&
+			r.calls.join() === "xai/m1:billing,fake-a/m1:ok" &&
+			r.cooldowns.includes("account:xai") &&
+			r.failures[0]?.kind === "usage-limit",
+		r,
+	);
+});
+
+scenario("billing failover: exact denial overrides an unavailable live quota reader", () => {
+	setQuota({ "fake-a": { status: 500 }, "fake-b": { five: 70, seven: 70 } });
+	const r = runPi(withQuota(makeHome("billing-unreadable")), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["billing"] } });
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:billing,fake-b/m1:ok" && r.cooldowns.includes("account:fake-a"), r);
+});
+
+scenario("billing failover: bounded account attempts never fall into PAYG", () => {
+	const home = withTiers(makeHome("billing-bounded"), (t) => {
+		t.payg = ["fake-c"];
+	});
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["billing"], "fake-b/m1": ["billing"] } });
+	return check(r.final?.stopReason === "error" && r.calls.join() === "fake-a/m1:billing,fake-b/m1:billing" && r.failures.length === 2, r);
+});
+
+scenario("billing failover: a generic non-retryable permission denial tries another subscription", () => {
+	const r = runPi(makeHome("permission-next"), { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	return check(
+		answered(r) === "fake-b/m1" &&
+			r.calls.join() === "fake-a/m1:403,fake-b/m1:ok" &&
+			r.failures[0]?.kind === "forbidden" &&
+			!r.cooldowns.includes("account:fake-a"),
+		r,
+	);
+});
+
+scenario("billing failover: unknown errors ask Jev once and reuse its verdict across tiers", () => {
+	const home = withTiers(makeHome("unknown-cache"), (t) => {
+		t.tiers.deep.chain = ["fake-a/m1:low", "fake-c/m2:low"];
+	});
+	const r = runPi(home, { model: "tier/default", prompt: ["hello", "/tier deep", "again"], plan: { "fake-a/m1": ["unknown", "unknown"] } });
+	const asks = readFileSync(join(home, "calls.tsv.recovery"), "utf8").trim().split("\n");
+	return check(
+		answered(r) === "fake-c/m2" &&
+			r.calls.join() === "fake-a/m1:unknown,fake-b/m1:ok,fake-a/m1:unknown,fake-c/m2:ok" &&
+			asks.length === 1 &&
+			JSON.parse(asks[0]).classifier === "fake-cls/jev",
+		{
+			...r,
+			recoveryAsks: asks,
+		},
+	);
+});
+
+scenario("billing failover: Jev retry is bounded to one retry before changing accounts", () => {
+	const home = makeHome("unknown-retry");
+	const r = runPi(home, {
+		model: "tier/default",
+		prompt: "hello",
+		plan: { "fake-a/m1": ["unknown", "unknown"] },
+		env: { FAKE_RECOVERY: JSON.stringify({ choice: "retry" }) },
+	});
+	const asks = readFileSync(join(home, "calls.tsv.recovery"), "utf8").trim().split("\n");
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:unknown,fake-a/m1:unknown,fake-b/m1:ok" && asks.length === 1, {
+		...r,
+		recoveryAsks: asks,
+	});
+});
+
+scenario("billing failover: unavailable or malformed Jev defaults to failover", () => {
+	const runs = [{ error: "classifier unavailable" }, { choice: "pay-money" }].map((spec, i) =>
+		runPi(makeHome(`unknown-fallback-${i}`), {
+			model: "tier/default",
+			prompt: "hello",
+			plan: { "fake-a/m1": ["unknown"] },
+			env: { FAKE_RECOVERY: JSON.stringify(spec) },
+		}),
+	);
+	return check(
+		runs.every((r) => answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:unknown,fake-b/m1:ok"),
+		{ runs },
+	);
+});
+
+scenario("billing failover: Jev cooldown and timeout remain bounded and skip the failed account", () => {
+	const runs = [{ choice: "cooldown" }, { stall: true }].map((spec, i) => {
+		const home = withTiers(makeHome(`unknown-bounded-${i}`), (t) => {
+			t.auto.providerTimeoutSeconds = 1;
+		});
+		return runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["unknown"] }, env: { FAKE_RECOVERY: JSON.stringify(spec) } });
+	});
+	return check(
+		runs.every((r) => answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:unknown,fake-b/m1:ok") && runs[0].cooldowns.includes("account:fake-a"),
+		{ runs },
+	);
+});
+
+scenario("billing failover: a failed explicit override is not reintroduced into recovery", () => {
+	const r = runPi(makeHome("override-billing"), { model: "tier/default", prompt: "Model override: fake-a/m1\nhello", plan: { "fake-a/m1": ["billing"] } });
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:billing,fake-b/m1:ok", r);
+});
+
+scenario("billing failover: Jev auth-stop preserves the provider error without another attempt", () => {
+	const r = runPi(makeHome("unknown-auth"), {
+		model: "tier/default",
+		prompt: "hello",
+		plan: { "fake-a/m1": ["unknown"] },
+		env: { FAKE_RECOVERY: JSON.stringify({ choice: "auth-stop" }) },
+	});
+	return check(
+		r.final?.stopReason === "error" && r.final.error === "Unrecognized upstream refusal: nebula fracture" && r.calls.join() === "fake-a/m1:unknown",
+		r,
+	);
+});
+
+scenario("billing failover: direct incident-sized request takes positive room below the floor and never the undersized model", () => {
+	setQuota({ "fake-a": { five: 3, seven: 3 }, "fake-b": USED_UP, "fake-c": USED_UP });
+	const home = withTiers(withQuota(makeHome("direct-positive-room")), (t) => {
+		t.tiers.compact.chain = ["fake-small/tiny:low", "fake-a/m1:low"];
+	});
+	const out = join(home, "direct.json");
+	const r = runPi(home, {
+		model: "tier/default",
+		prompt: "/direct-probe compact",
+		env: { DIRECT_OUT: out, DIRECT_TOKENS: "405849", FAKE_CONTEXT: "1000000" },
+		extra: ["-e", DIRECT],
+	});
+	const direct = JSON.parse(readFileSync(out, "utf8"));
+	return check(
+		direct.results.join() === "fake-a/m1:stop,fake-a/m1:stop" &&
+			direct.published.length === 0 &&
+			r.calls.join() === "fake-a/m1:ok,fake-a/m1:ok" &&
+			r.routes.every((x) => x.tokens >= 405849),
+		{ ...r, direct },
+	);
 });
 
 quotaServer.kill();
