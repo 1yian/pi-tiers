@@ -16,7 +16,7 @@ export interface ResponseInfo {
 }
 
 const USAGE =
-	/usage.?limit|quota|insufficient_quota|billing|out of budget|available balance|GoUsageLimitError|FreeUsageLimitError|subscription_sharing_usage_limit|weekly limit|(?:5|five)[- ]hour|exceed(?:ed)? your (?:account'?s )?(?:rate|usage) limit/i;
+	/usage.?limit|quota|insufficient_quota|billing|out of budget|(?:run |ran )?out of credits|insufficient (?:credits|funds)|credit balance|(?:need|requires?) (?:a |an )?(?:[\w-]+ )?subscription|subscription (?:expired|inactive|required)|available balance|GoUsageLimitError|FreeUsageLimitError|subscription_sharing_usage_limit|weekly limit|(?:5|five)[- ]hour|exceed(?:ed)? your (?:account'?s )?(?:rate|usage) limit/i;
 const AUTH = /\b401\b|unauthori[sz]ed|invalid.?(?:api.?)?key|authentication|not logged in|token (?:has )?expired/i;
 /** 403 without an auth reason: this model is off limits for the account (disabled, free tier refused, region). */
 const FORBIDDEN = /\b403\b|forbidden|access is disabled|not allowed|FreeTierError|permission/i;

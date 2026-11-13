@@ -15,6 +15,12 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const ERRORS: Record<string, { status: number; message: string; headers?: Record<string, string> }> = {
+	billing: {
+		status: 403,
+		message:
+			'xai API error (403): 403 "You have run out of credits or need a Grok subscription. Add credits at https://grok.com/?_s=usage or upgrade at https://grok.com/supergrok."',
+	},
+	unknown: { status: 418, message: "Unrecognized upstream refusal: nebula fracture" },
 	"429": { status: 429, message: "429 rate_limit_error: Too many requests", headers: { "retry-after": "120" } },
 	usage: { status: 429, message: "FreeUsageLimitError: free usage limit reached for this account" },
 	"500": { status: 500, message: "500 Internal server error" },
@@ -107,12 +113,12 @@ const chat = (id: string, contextWindow = 200_000) => ({
 });
 
 export default function (pi: ExtensionAPI) {
-	for (const provider of ["fake-a", "fake-b", "fake-c"]) {
+	for (const provider of ["fake-a", "fake-b", "fake-c", "xai"]) {
 		pi.registerProvider(provider, {
 			baseUrl: "https://fake.invalid",
 			apiKey: `key-${provider}`,
 			api: "fake-api",
-			models: [chat("m1"), chat("m2")],
+			models: [chat("m1", Number(process.env.FAKE_CONTEXT ?? 200_000)), chat("m2")],
 			streamSimple: stream,
 		});
 	}
@@ -140,6 +146,20 @@ export default function (pi: ExtensionAPI) {
 					options?: { signal?: AbortSignal },
 				) => {
 					const base = { api: model.api, provider: model.provider, model: model.id, timestamp: Date.now() };
+					if (context.questions.recovery) {
+						appendFileSync(`${process.env.FAKE_CALLS}.recovery`, `${JSON.stringify({ classifier: `${model.provider}/${model.id}`, ...context })}\n`);
+						const spec = JSON.parse(process.env.FAKE_RECOVERY || '{"choice":"failover"}');
+						if (spec.error) return { ...base, answers: {}, stopReason: "error", errorMessage: spec.error };
+						if (spec.stall) {
+							await new Promise<void>((resolve) => options?.signal?.addEventListener("abort", () => resolve(), { once: true }));
+							return { ...base, answers: {}, stopReason: "aborted" };
+						}
+						return {
+							...base,
+							stopReason: "stop",
+							answers: { recovery: { type: "choice", choice: spec.choice, confidence: 1, probabilities: { [spec.choice]: 1 } } },
+						};
+					}
 					const asked = context.questions.provider;
 					if (asked) {
 						// The provider pick: FAKE_JEV is {"choice"}, {"error"}, {"delayMs"}, {"first": true} (the first listed row), or {"sequence": [...]} (the Nth ask answers the Nth entry, "first" or a row);

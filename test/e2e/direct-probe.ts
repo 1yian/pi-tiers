@@ -14,7 +14,13 @@ export default function (pi: ExtensionAPI) {
 			published.length = 0;
 			for (let i = 0; i < 2; i++) {
 				if (!model) break;
-				const stream = ctx.modelRegistry.streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: Date.now() }] } as never, {});
+				const stream = ctx.modelRegistry.streamSimple(
+					model,
+					{
+						messages: [{ role: "user", content: process.env.DIRECT_TOKENS ? "x".repeat(Number(process.env.DIRECT_TOKENS) * 4) : "hi", timestamp: Date.now() }],
+					} as never,
+					{},
+				);
 				const msg = await (stream as unknown as { result(): Promise<{ provider: string; model: string; stopReason: string }> }).result();
 				results.push(`${msg.provider}/${msg.model}:${msg.stopReason}`);
 			}

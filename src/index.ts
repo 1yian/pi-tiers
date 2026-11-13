@@ -1,7 +1,3 @@
-// pi-tiers: work tiers as virtual models. Every tier commits a session to one model from an ordered chain.
-// A failed call is retried on that model by Pi's own backoff (settings `retry`). Two things move off it: a failure whose
-// live quota check confirms an exhausted account moves the session to another provider, and repeated connection
-// failures move the rest of the run to the next service in the chain. `tier/auto` picks the tier with a classifier.
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -23,6 +19,7 @@ import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFro
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
 import { askProvider, tableRow } from "./provider-pick.ts";
 import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, kindOf, type Outcome, type QuotaReading, QuotaStore, roomFor } from "./quota.ts";
+import { ErrorDecider } from "./recovery.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
 export const PROVIDER = "tier";
@@ -34,7 +31,7 @@ const ENTRY = "pi-tiers";
 /** Room left for the response when checking whether a conversation fits a model's context window. */
 const CONTEXT_HEADROOM = 16_000;
 /** Continuations the extension may request in one run after a request failed outright. */
-const MAX_CONTINUES = 4;
+const MAX_CONTINUES = 32;
 /** Consecutive connection failures (no HTTP response) a model gets within a run before the run leaves its service. Pi's retry
  * budget is shared by every model of the run, so the default five retries cover three services at two attempts each. */
 const TRANSIENT_ATTEMPTS = 2;
@@ -94,8 +91,6 @@ export default function piTiers(pi: ExtensionAPI): void {
 	let lastResponse: (ResponseInfo & { key?: string; atMs: number }) | undefined;
 	let lastTier: string | undefined;
 	let lastAssistant: AssistantMessage | undefined;
-	/** Set when the last failed turn's live quota check confirmed an exhausted account; keeps the provider's own error for the failure log.
-	 * `next` is the model the turn continues on, absent when every provider is used up (the turn then ends with `line`). */
 	let exhausted: { line: string; original: string; next?: string } | undefined;
 	/** Sessions (and tiers) whose account just proved exhausted: their next request picks again instead of staying put. */
 	const leaving = new Set<string>();
@@ -109,6 +104,16 @@ export default function piTiers(pi: ExtensionAPI): void {
 	let lastTokens = 0;
 	let continues = 0;
 	const pending: string[] = [];
+	const failedAccounts = new Set<string>();
+	const directAttempts = new WeakMap<AbortSignal, { failed: Set<string>; retried: Set<string> }>();
+	let unsignalledDirect = { failed: new Set<string>(), retried: new Set<string>() };
+	const retriedAccounts = new Set<string>();
+	const decider = new ErrorDecider();
+	const recoveryAction = async (provider: string, error: string, response: ResponseInfo | undefined, ctx: ExtensionContext, signal?: AbortSignal) => {
+		const classified = classifyFailure(error, response, cfg.cooldowns, Date.now());
+		if (isTransient(error, response) || classified?.kind === "rate-limit" || classified?.kind === "server") return "retry" as const;
+		return classified ? ("failover" as const) : decider.decide(provider, error, response?.status, cfg.auto, ctx, signal);
+	};
 
 	const log = (record: Record<string, unknown>) => {
 		try {
@@ -152,18 +157,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 	};
 
 	const checker =
-		(ctx: ExtensionContext, tokens: number, nowMs: number, useQuota = false) =>
+		(ctx: ExtensionContext, tokens: number, nowMs: number, useQuota = false, allowLow = false) =>
 		(c: Candidate): SkipReason | undefined => {
 			const model = ctx.modelRegistry.find(c.provider, c.model);
 			if (!model) return "unknown-model";
 			if (!ctx.modelRegistry.hasConfiguredAuth(model)) return "no-credentials";
+			if (tokens && model.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM) return "context-too-small";
 			if (store.get(accountKey(c.provider), nowMs) || store.get(modelKey(c.provider, c.model), nowMs)) return "cooling";
 			if (useQuota && quota && cfg.quota) {
 				const reading = quota.latest.get(c.provider);
 				const room = reading && roomFor(reading, c.model);
-				if (room !== undefined && room < cfg.quota.minRemainingPercent) return "quota-low";
+				if (room !== undefined && (room <= 0 || (!allowLow && room < cfg.quota.minRemainingPercent))) return "quota-low";
 			}
-			if (tokens && model.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM) return "context-too-small";
 			return undefined;
 		};
 
@@ -188,7 +193,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const mark = store.get(accountKey(provider), nowMs);
 			if (mark?.reason !== "usage-limit" || (mark.atMs ?? 0) > o.reading.atMs) continue;
 			const room = accountRoom(o.reading);
-			if (room === undefined || room < cfg.quota.minRemainingPercent) continue;
+			if (room === undefined || room <= 0) continue;
 			store.clear(accountKey(provider), o.reading.atMs);
 			log({ event: "cooldown-cleared", key: accountKey(provider), reason: mark.reason, room: Math.round(room), source: o.source });
 		}
@@ -234,8 +239,6 @@ export default function piTiers(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 		{ transientCools, notify = true }: { transientCools: boolean; notify?: boolean },
 	): Failure | undefined => {
-		// Providers with a live reader are marked only from a confirmed quota reading, never from error text.
-		if (live(provider)) return undefined;
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
 		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
@@ -244,7 +247,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			return undefined;
 		}
 		const failure = classifyFailure(errorMessage, response, cfg.cooldowns, nowMs);
-		if (!failure) return undefined;
+		if (!failure || (live(provider) && (failure.kind === "rate-limit" || failure.kind === "server"))) return undefined;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
 		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs });
 		log({ event: "failure", key, kind: failure.kind, scope: failure.scope, until: new Date(failure.untilMs).toISOString(), error: errorMessage.slice(0, 300) });
@@ -332,15 +335,16 @@ export default function piTiers(pi: ExtensionAPI): void {
 		model: string,
 		ctx: ExtensionContext,
 		fresh: boolean,
+		floor = cfg.quota?.minRemainingPercent ?? 0,
 	): Promise<{ window: NonNullable<ReturnType<typeof exhaustedWindow>>; line: string } | undefined> => {
 		if (!quota || !cfg.quota || !live(provider)) return undefined;
 		const nowMs = Date.now();
 		const outcome = (await quota.read([provider], (p) => ctx.modelRegistry.getApiKeyForProvider(p), nowMs, fresh)).get(provider);
 		if (!outcome || !("reading" in outcome)) return undefined;
 		clearStaleMarks(new Map([[provider, outcome]]), nowMs);
-		const window = exhaustedWindow(outcome.reading, model, cfg.quota.minRemainingPercent);
+		const window = exhaustedWindow(outcome.reading, model, floor);
 		if (!window) return undefined;
-		if (window.resetAtMs) {
+		if (window.resetAtMs && window.remainingPercent <= 0) {
 			const key = window.scope ? modelKey(provider, model) : accountKey(provider);
 			store.set(key, { untilMs: window.resetAtMs, reason: "usage-limit", atMs: Date.now() });
 			log({ event: "failure", source: "live-quota", key, kind: "usage-limit", until: new Date(window.resetAtMs).toISOString() });
@@ -352,13 +356,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 	// The router makes the final choice (the classifier among the usable ones, code as the fallback).
 	const alternative = async (ctx: ExtensionContext): Promise<string | undefined> => {
 		if (!lastTier || continues >= MAX_CONTINUES) return undefined;
-		const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg);
+		const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg).filter(
+			(c) => !failedAccounts.has(c.provider) && !cfg.payg.has(c.provider),
+		);
 		await readQuota(
 			candidates.map((c) => c.provider),
 			ctx,
 			Date.now(),
 		);
-		const result = pick({ candidates, check: checker(ctx, lastTokens, Date.now(), true) });
+		const ready = candidates.filter((c) => !checker(ctx, lastTokens, Date.now(), true)(c));
+		const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, lastTokens, Date.now(), true, true)(c));
+		const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
+		const result = pick({ candidates: pool, check: checker(ctx, lastTokens, Date.now(), true, true) });
 		return result.chosen && !result.compacting ? candidateKey(result.chosen) : undefined;
 	};
 
@@ -374,6 +383,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 
 		// A user message starts a new run: every service is tried again and the session is back on its own model.
 		if (req.reason === "user") {
+			continues = 0;
+			failedAccounts.clear();
+			retriedAccounts.clear();
 			failedServices.clear();
 			runModel = undefined;
 			transientStreak = undefined;
@@ -409,11 +421,42 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const rule = ruleFor(ctx.cwd);
 		const expand = expansion(ctx);
 		let candidates = subscriptionsFirst(candidatesFor(cfg, tier, rule, expand), cfg.payg);
+		let excluded = failedAccounts;
+		if (req.reason === "direct") {
+			let attempts = req.signal ? directAttempts.get(req.signal) : unsignalledDirect;
+			if (!req.failed || !attempts) {
+				attempts = { failed: new Set<string>(), retried: new Set<string>() };
+				if (req.signal) directAttempts.set(req.signal, attempts);
+				else unsignalledDirect = attempts;
+			}
+			excluded = attempts.failed;
+			if (req.failed) {
+				const failed = req.failed;
+				if (req.signal?.aborted || failed.message.stopReason === "aborted") throw new Error("pi-tiers: direct request aborted");
+				const action = await recoveryAction(failed.model.provider, failed.message.errorMessage ?? "", undefined, ctx, req.signal);
+				if (req.signal?.aborted) throw new Error("pi-tiers: direct request aborted");
+				if (action === "cooldown")
+					store.set(accountKey(failed.model.provider), { untilMs: Date.now() + cfg.cooldowns.serverErrorSeconds * 1000, reason: "server", atMs: Date.now() });
+				if (action === "auth-stop") throw new Error("pi-tiers: direct request requires authentication");
+				if (action === "retry" && !attempts.retried.has(failed.model.provider)) attempts.retried.add(failed.model.provider);
+				else {
+					noteFailure(failed.model.provider, failed.model.id, failed.message.errorMessage ?? "", ctx, { transientCools: true });
+					excluded.add(failed.model.provider);
+				}
+			}
+		}
+		candidates = candidates.filter((c) => !excluded.has(c.provider) && (!excluded.size || !cfg.payg.has(c.provider)));
 		if (!candidates.length && avoided().size && candidatesFor(cfg, tier, rule, { ...expand, skip: undefined }).length) {
 			throw new Error(`pi-tiers: PI_TIERS_AVOID (${[...avoided()].join(",")}) leaves no provider for tier '${tier}'.`);
 		}
 		const override = state.override;
-		if (override && !(rule?.allowProviders && !rule.allowProviders.has(override.provider)) && !expand.skip?.has(override.provider)) {
+		if (
+			override &&
+			!excluded.has(override.provider) &&
+			(!excluded.size || !cfg.payg.has(override.provider)) &&
+			!(rule?.allowProviders && !rule.allowProviders.has(override.provider)) &&
+			!expand.skip?.has(override.provider)
+		) {
 			candidates = [{ ...override, position: 0 }, ...candidates];
 		}
 		// A service that failed to connect twice in a row is left for the rest of the run, for every request including direct ones
@@ -438,9 +481,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		let departed = leaving.delete(servedKey);
 		if (!departed && sticky && req.reason === "direct") {
 			const slash = sticky.indexOf("/");
-			departed = Boolean(await confirmExhausted(sticky.slice(0, slash), sticky.slice(slash + 1), ctx, false));
+			departed = Boolean(await confirmExhausted(sticky.slice(0, slash), sticky.slice(slash + 1), ctx, false, Number.EPSILON));
 		}
-		if (departed) sticky = undefined;
+		if (departed || (sticky && !candidates.some((c) => candidateKey(c) === sticky))) sticky = undefined;
 		const tokens = requestTokens(req.messages);
 		if (req.reason !== "direct") {
 			lastTier = tier;
@@ -463,10 +506,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 				const l = load.of(c.provider, nowMs, sessionId);
 				return l.agents + l.tokens / TOKENS_PER_AGENT;
 			};
+			const ready = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
+			const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
+			const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
 			const scored = assign({
-				candidates,
+				candidates: req.reason === "direct" || excluded.size ? pool : candidates,
+
 				payg: cfg.payg,
-				check: checker(ctx, tokens, nowMs, true),
+				check: checker(ctx, tokens, nowMs, true, pool === low),
 				score: (c) => {
 					const l = load.of(c.provider, nowMs, sessionId);
 					return l.utilization * UTILIZATION_WEIGHT + l.agents + l.tokens / TOKENS_PER_AGENT;
@@ -484,7 +531,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			if (req.reason === "direct" || candidates[0]?.position === 0) return scored;
 			// The tier is known; now the classifier chooses the provider from the tier's own usable candidates,
 			// subscriptions first. Code validates the answer and falls back to the ranked pick above.
-			const usable = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
+			const usable = pool;
 			// Every usable provider is offered, pay-per-token ones labelled as such; the classifier is told to prefer subscriptions.
 			const offered = usable;
 			if (!offered.length) return scored;
@@ -507,18 +554,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 		};
 		const known = sticky ? candidates.find((c) => candidateKey(c) === sticky) : undefined;
 		const stuck = known && ctx.modelRegistry.find(known.provider, known.model);
-		// Too small for the conversation is not a reason to leave: Pi compacts before sending.
 		const tooSmall = Boolean(stuck?.contextWindow && stuck.contextWindow < tokens + CONTEXT_HEADROOM);
+		if (tooSmall || (req.reason === "direct" && known && checker(ctx, tokens, nowMs, true)(known))) sticky = undefined;
 		const result: PickResult =
-			known && stuck && ctx.modelRegistry.hasConfiguredAuth(stuck)
+			sticky && known && stuck && ctx.modelRegistry.hasConfiguredAuth(stuck)
 				? { chosen: known, skipped: [], ...(tooSmall ? { compacting: true } : {}) }
 				: await selectNew();
 
-		if (!result.chosen) {
+		if (!result.chosen || result.compacting) {
 			const why = result.skipped.map((s) => `${s.key}: ${s.reason}`).join(", ") || "empty chain";
 			if (req.reason !== "direct") publish(ctx, undefined, `${selected === AUTO ? `auto → ${tier}` : tier} → no model available`);
 			log({ event: "route", selected, tier, reason: req.reason, chosen: null, skipped: result.skipped });
-			throw new Error(`pi-tiers: no usable model for tier '${tier}' (${why})`);
+			throw new Error(`pi-tiers: no usable model for tier '${tier}' (${why}${excluded.size ? `; tried accounts: ${[...excluded].join(", ")}` : ""})`);
 		}
 		const chosen = result.chosen;
 		const model = ctx.modelRegistry.find(chosen.provider, chosen.model)!;
@@ -620,12 +667,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 	pi.on("agent_start", async () => {
 		lastAssistant = undefined;
 		exhausted = undefined;
-		continues = 0;
 	});
 
-	// A failed turn whose account has run out of quota: the run continues on another provider when one is usable, and ends
-	// with exactly one line naming the provider and window when none is. Any other failure is Pi's to retry (settings `retry`)
-	// on the same model, and when retries run out it is surfaced as it is: pi-tiers never switches provider for it.
 	pi.on("message_end", async (event, ctx) => {
 		if (event.message.role !== "assistant") return;
 		lastAssistant = event.message as AssistantMessage;
@@ -634,10 +677,31 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (lastAssistant.stopReason !== "error" && usage)
 			load.addUsage(lastAssistant.provider, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheWrite ?? 0), Date.now());
 		while (pending.length) pi.appendEntry<EntryData>(ENTRY, { text: pending.shift()! });
-		if (lastAssistant.stopReason !== "error" || ctx.model?.provider !== PROVIDER) return;
+		if (lastAssistant.stopReason !== "error" || ctx.model?.provider !== PROVIDER || lastAssistant.provider === PROVIDER) return;
 		const failed = lastAssistant;
-		const found = await confirmExhausted(failed.provider, failed.model, ctx, true);
-		if (!found) return;
+		exhausted = undefined;
+		if (ctx.signal?.aborted) return;
+		const error = failed.errorMessage ?? "";
+		const response = lastResponse?.key === `${failed.provider}/${failed.model}` ? lastResponse : undefined;
+		const classified = classifyFailure(error, response, cfg.cooldowns, Date.now());
+		const confirmed = classified?.kind === "usage-limit" ? undefined : await confirmExhausted(failed.provider, failed.model, ctx, true);
+		if (!confirmed && (isTransient(error, response) || classified?.kind === "rate-limit" || classified?.kind === "server")) return;
+		const action = confirmed ? "failover" : await recoveryAction(failed.provider, error, response, ctx, ctx.signal);
+		log({ event: "recovery", provider: failed.provider, action });
+		if (action === "auth-stop") return;
+		if (action === "retry" && !retriedAccounts.has(failed.provider)) {
+			retriedAccounts.add(failed.provider);
+			exhausted = { line: "Retrying provider once", original: error, next: `${failed.provider}/${failed.model}` };
+			return;
+		}
+		failedAccounts.add(failed.provider);
+		const failure = noteFailure(failed.provider, failed.model, error, ctx, { transientCools: true, notify: false });
+		if (action === "cooldown" && !failure)
+			store.set(accountKey(failed.provider), { untilMs: Date.now() + cfg.cooldowns.serverErrorSeconds * 1000, reason: "server", atMs: Date.now() });
+		const found = confirmed ?? {
+			line: `pi-tiers: ${failed.provider} failed; no allowed subscription can continue.`,
+			window: { label: failure?.kind ?? "provider" },
+		};
 		const next = await alternative(ctx);
 		const key = `${failed.provider}/${failed.model}`;
 		exhausted = { line: found.line, original: failed.errorMessage ?? "", next };
@@ -646,17 +710,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (next) leaving.add(`${ctx.sessionManager.getSessionId()}\0${lastTier}`);
 		lastAssistant = {
 			...failed,
-			errorMessage: next ? `pi-tiers: ${failed.provider} ${found.window.label} quota exhausted; continuing on another provider.` : found.line,
+			errorMessage: next ? `pi-tiers: ${failed.provider} ${found.window.label} failure; continuing on another provider.` : found.line,
 		};
 		return { message: lastAssistant };
 	});
 
-	// A failure Pi no longer retries ends the run. When it was a confirmed quota exhaustion with another provider usable,
-	// ask for one more request, which the router sends there. Otherwise the session keeps its model and the failure
-	// is only recorded for Fleet, which decides whether to restart the worker.
 	pi.on("agent_before_settle", async (event, ctx) => {
 		const failed = lastAssistant;
-		if (event.outcome !== "error" || failed?.stopReason !== "error" || ctx.model?.provider !== PROVIDER) return;
+		if (event.outcome !== "error" || failed?.stopReason !== "error" || ctx.model?.provider !== PROVIDER || failed.provider === PROVIDER) return;
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted) return;
@@ -670,7 +731,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 				{
 					type: "custom_message" as const,
 					customType: ENTRY,
-					content: `pi-tiers: ${failed.provider}/${failed.model} has no quota left; continuing the interrupted turn on another provider.`,
+					content: `pi-tiers: recovering the interrupted turn after ${failed.provider}/${failed.model} failed.`,
 					display: true,
 				},
 			],
