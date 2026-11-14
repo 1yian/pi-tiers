@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
@@ -57,6 +58,14 @@ interface TierState {
 
 interface EntryData {
 	text: string;
+}
+
+function sanitizeError(value: string): string {
+	return value
+		.replace(/https?:\/\/\S+/gi, "[url]")
+		.replace(/(?:bearer\s+|(?:key|token|secret|password)["']?\s*[:=]\s*["']?)[^\s,;"']+/gi, "[redacted]")
+		.replace(/[A-Za-z0-9_+/=-]{24,}/g, "[redacted]")
+		.slice(0, 4000);
 }
 
 export default function piTiers(pi: ExtensionAPI): void {
@@ -237,12 +246,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 		model: string,
 		errorMessage: string,
 		ctx: ExtensionContext,
-		{ transientCools, notify = true }: { transientCools: boolean; notify?: boolean },
+		{ notify = true }: { notify?: boolean } = {},
 	): Failure | undefined => {
 		const nowMs = Date.now();
 		const key = `${provider}/${model}`;
 		const response = lastResponse && lastResponse.key === key && nowMs - lastResponse.atMs < 120_000 ? lastResponse : undefined;
-		if (!transientCools && isTransient(errorMessage, response)) {
+		if (isTransient(errorMessage, response)) {
 			log({ event: "transient", key, error: errorMessage.slice(0, 300) });
 			return undefined;
 		}
@@ -300,7 +309,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			provider: failed.provider,
 			model: failed.model,
 			status: response?.status ?? null,
-			kind: classified?.kind ?? (isTransient(message, response) ? "transient" : "unknown"),
+			kind: isTransient(message, response) ? "transient" : (classified?.kind ?? "unknown"),
 			scope: classified?.scope ?? null,
 			message: message.slice(0, 4000),
 			retryAfter: headers["retry-after"] ?? null,
@@ -392,7 +401,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 		// Pi retries a failed call with backoff; a provider without a live reader keeps a text-classified mark.
 		if (req.reason === "retry" && req.failed) {
-			noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx, { transientCools: false });
+			noteFailure(req.failed.model.provider, req.failed.model.id, req.failed.message.errorMessage ?? "", ctx);
 			noteRetry(req.failed);
 		}
 
@@ -440,7 +449,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 				if (action === "auth-stop") throw new Error("pi-tiers: direct request requires authentication");
 				if (action === "retry" && !attempts.retried.has(failed.model.provider)) attempts.retried.add(failed.model.provider);
 				else {
-					noteFailure(failed.model.provider, failed.model.id, failed.message.errorMessage ?? "", ctx, { transientCools: true });
+					noteFailure(failed.model.provider, failed.model.id, failed.message.errorMessage ?? "", ctx);
 					excluded.add(failed.model.provider);
 				}
 			}
@@ -462,7 +471,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// A service that failed to connect twice in a row is left for the rest of the run, for every request including direct ones
 		// (a compaction summary sent to a service this run cannot reach would only fail). When every service failed there is nowhere to
 		// go, and the run keeps retrying where it is.
-		const reachable = failedServices.size ? candidates.filter((c) => !failedServices.has(serviceOf(c.provider))) : candidates;
+		const tokens = requestTokens(req.messages);
+		const reachable = failedServices.size
+			? candidates.filter((c) => !failedServices.has(serviceOf(c.provider)) && !checker(ctx, tokens, nowMs, true, true)(c))
+			: candidates;
 		const moved = reachable.length > 0 && reachable.length < candidates.length;
 		if (moved) candidates = reachable;
 		// Stay on the model that last served this session and tier. It is left when live quota confirmed the account exhausted
@@ -484,7 +496,6 @@ export default function piTiers(pi: ExtensionAPI): void {
 			departed = Boolean(await confirmExhausted(sticky.slice(0, slash), sticky.slice(slash + 1), ctx, false, Number.EPSILON));
 		}
 		if (departed || (sticky && !candidates.some((c) => candidateKey(c) === sticky))) sticky = undefined;
-		const tokens = requestTokens(req.messages);
 		if (req.reason !== "direct") {
 			lastTier = tier;
 			lastTokens = tokens;
@@ -585,6 +596,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		}
 		routedSessions.add(sessionId);
 		lastRouteKey = chosenKey;
+		lastResponse = undefined;
 		if (req.reason !== "direct") load.assign(sessionId, chosen.provider);
 		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${chosenKey}`);
 
@@ -684,8 +696,41 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const error = failed.errorMessage ?? "";
 		const response = lastResponse?.key === `${failed.provider}/${failed.model}` ? lastResponse : undefined;
 		const classified = classifyFailure(error, response, cfg.cooldowns, Date.now());
+		const hardFailure = classified && ["usage-limit", "auth", "forbidden"].includes(classified.kind);
+		const retryable = !hardFailure && (isTransient(error, response) || isRetryableAssistantError(failed));
+		const diagnostics = (failed as AssistantMessage & { diagnostics?: Record<string, unknown>[] }).diagnostics;
+		log({
+			event: "provider-error",
+			key: `${failed.provider}/${failed.model}`,
+			error: sanitizeError(error),
+			retryable,
+			failedAccounts: [...failedAccounts],
+			failedServices: [...failedServices],
+			diagnostics: diagnostics
+				?.filter((d) => d.type === "provider_transport_failure")
+				.slice(0, 8)
+				.map((d) => {
+					const cause = d.error as Record<string, unknown> | undefined;
+					const details = d.details as Record<string, unknown> | undefined;
+					return {
+						type: d.type,
+						timestamp: typeof d.timestamp === "number" ? d.timestamp : undefined,
+						error: {
+							name: typeof cause?.name === "string" ? sanitizeError(cause.name) : undefined,
+							message: typeof cause?.message === "string" ? sanitizeError(cause.message) : undefined,
+							code: typeof cause?.code === "number" ? cause.code : undefined,
+						},
+						details: {
+							configuredTransport: ["auto", "websocket", "sse"].includes(String(details?.configuredTransport)) ? details?.configuredTransport : undefined,
+							phase: ["before_message_stream_start", "after_message_stream_start"].includes(String(details?.phase)) ? details?.phase : undefined,
+							eventsEmitted: typeof details?.eventsEmitted === "boolean" ? details.eventsEmitted : undefined,
+							requestBytes: typeof details?.requestBytes === "number" ? details.requestBytes : undefined,
+						},
+					};
+				}),
+		});
 		const confirmed = classified?.kind === "usage-limit" ? undefined : await confirmExhausted(failed.provider, failed.model, ctx, true);
-		if (!confirmed && (isTransient(error, response) || classified?.kind === "rate-limit" || classified?.kind === "server")) return;
+		if (!confirmed && retryable) return;
 		const action = confirmed ? "failover" : await recoveryAction(failed.provider, error, response, ctx, ctx.signal);
 		log({ event: "recovery", provider: failed.provider, action });
 		if (action === "auth-stop") return;
@@ -695,7 +740,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			return;
 		}
 		failedAccounts.add(failed.provider);
-		const failure = noteFailure(failed.provider, failed.model, error, ctx, { transientCools: true, notify: false });
+		const failure = noteFailure(failed.provider, failed.model, error, ctx, { notify: false });
 		if (action === "cooldown" && !failure)
 			store.set(accountKey(failed.provider), { untilMs: Date.now() + cfg.cooldowns.serverErrorSeconds * 1000, reason: "server", atMs: Date.now() });
 		const found = confirmed ?? {
@@ -721,7 +766,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// event.context.canContinue is false here because the run ends on the failed assistant message;
 		// the custom message returned below is what makes the continuation valid.
 		if (ctx.signal?.aborted) return;
-		noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { transientCools: true, notify: false });
+		noteFailure(failed.provider, failed.model, exhausted?.original ?? failed.errorMessage ?? "", ctx, { notify: false });
 		const next = exhausted?.next;
 		surfaceFailure(failed, lastTier, next ? "pool" : "none", ctx);
 		if (!next) return;
