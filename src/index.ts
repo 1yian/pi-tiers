@@ -33,8 +33,6 @@ const ENTRY = "pi-tiers";
 const CONTEXT_HEADROOM = 16_000;
 /** Continuations the extension may request in one run after a request failed outright. */
 const MAX_CONTINUES = 32;
-/** Consecutive connection failures (no HTTP response) a model gets within a run before the run leaves its service. Pi's retry
- * budget is shared by every model of the run, so the default five retries cover three services at two attempts each. */
 const TRANSIENT_ATTEMPTS = 2;
 /** Weights of a provider's load when choosing where a session starts. These are heuristics, not measurements:
  * quota already used (0..1) outweighs a whole agent, and 500K recent tokens count as one agent. */

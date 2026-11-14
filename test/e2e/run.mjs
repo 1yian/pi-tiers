@@ -402,10 +402,10 @@ for (const kind of ["ws1000", "partial"]) {
 		});
 		return check(
 			r.status === 0 &&
-			answered(r) === "fake-a/m1" &&
-			r.calls.join() === `fake-a/m1:${kind},fake-a/m1:${kind},fake-c/m2:ok,fake-a/m1:ok` &&
-			r.cooldowns.length === 0 &&
-			(kind !== "partial" || r.textDeltas.includes("Partial response before disconnect")),
+				answered(r) === "fake-a/m1" &&
+				r.calls.join() === `fake-a/m1:${kind},fake-a/m1:${kind},fake-c/m2:ok,fake-a/m1:ok` &&
+				r.cooldowns.length === 0 &&
+				(kind !== "partial" || r.textDeltas.includes("Partial response before disconnect")),
 			r,
 		);
 	});
@@ -418,10 +418,10 @@ for (const kind of ["ws1000", "partial"]) {
 		});
 		return check(
 			r.status === 0 &&
-			r.final?.stopReason === "error" &&
-			r.final.error.includes("WebSocket stream closed before response.completed (code 1000)") &&
-			r.calls.join() === `fake-a/m1:${kind},fake-a/m1:${kind},fake-c/m2:${kind},fake-c/m2:${kind}` &&
-			r.cooldowns.length === 0,
+				r.final?.stopReason === "error" &&
+				r.final.error.includes("WebSocket stream closed before response.completed (code 1000)") &&
+				r.calls.join() === `fake-a/m1:${kind},fake-a/m1:${kind},fake-c/m2:${kind},fake-c/m2:${kind}` &&
+				r.cooldowns.length === 0,
 			r,
 		);
 	});
