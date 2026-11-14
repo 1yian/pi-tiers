@@ -472,6 +472,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 		// (a compaction summary sent to a service this run cannot reach would only fail). When every service failed there is nowhere to
 		// go, and the run keeps retrying where it is.
 		const tokens = requestTokens(req.messages);
+		if (failedServices.size)
+			await readQuota(
+				candidates.map((c) => c.provider),
+				ctx,
+				nowMs,
+			);
 		const reachable = failedServices.size
 			? candidates.filter((c) => !failedServices.has(serviceOf(c.provider)) && !checker(ctx, tokens, nowMs, true, true)(c))
 			: candidates;
