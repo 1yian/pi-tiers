@@ -736,7 +736,11 @@ export default function piTiers(pi: ExtensionAPI): void {
 				}),
 		});
 		const confirmed = classified?.kind === "usage-limit" ? undefined : await confirmExhausted(failed.provider, failed.model, ctx, true);
-		if (!confirmed && retryable) return;
+		if (!confirmed && retryable) {
+			if (isRetryableAssistantError(failed)) return;
+			lastAssistant = { ...failed, errorMessage: `Connection error: ${error}` };
+			return { message: lastAssistant };
+		}
 		const action = confirmed ? "failover" : await recoveryAction(failed.provider, error, response, ctx, ctx.signal);
 		log({ event: "recovery", provider: failed.provider, action });
 		if (action === "auth-stop") return;
