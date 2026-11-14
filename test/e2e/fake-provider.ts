@@ -28,7 +28,12 @@ const ERRORS: Record<string, { status: number; message: string; headers?: Record
 	"403": { status: 403, message: '403: {"type":"FreeTierError","message":"free tier can only be used from within the vendor app"}' },
 };
 
-const NO_RESPONSE: Record<string, string> = { timeout: "Request timed out.", connection: "Connection error." };
+const NO_RESPONSE: Record<string, string> = {
+	timeout: "Request timed out.",
+	connection: "Connection error.",
+	ws1000: "WebSocket stream closed before response.completed (code 1000)",
+	partial: "WebSocket stream closed before response.completed (code 1000)",
+};
 
 function inputTokens(context: unknown): number {
 	return Math.ceil(JSON.stringify((context as { messages?: unknown })?.messages ?? []).length / 4);
@@ -75,6 +80,14 @@ function stream(model: Model<Api>, context: unknown, options?: SimpleStreamOptio
 		if (outcome in NO_RESPONSE) {
 			message.stopReason = "error";
 			message.errorMessage = NO_RESPONSE[outcome];
+			if (outcome === "partial") {
+				const text = "Partial response before disconnect";
+				out.push({ type: "start", partial: message });
+				message.content.push({ type: "text", text: "" });
+				out.push({ type: "text_start", contentIndex: 0, partial: message });
+				(message.content[0] as { text: string }).text = text;
+				out.push({ type: "text_delta", contentIndex: 0, delta: text, partial: message });
+			}
 			out.push({ type: "error", reason: "error", error: message });
 			out.end();
 			return;
