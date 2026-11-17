@@ -54,7 +54,12 @@ function piCommand(home, { model, prompt, plan = {}, classify, cwd = home, env =
 		"-e",
 		FAKE,
 		...extra,
-		...(Array.isArray(prompt) ? prompt : [prompt]),
+		...(Array.isArray(prompt) ? prompt : [prompt]).map((text) => {
+			if (text.length < 128_000) return text;
+			const file = join(home, "prompt.md");
+			writeFileSync(file, text);
+			return `@${file}`;
+		}),
 	];
 	const options = {
 		cwd,
@@ -346,7 +351,7 @@ scenario("a model whose context window is too small is skipped", () => {
 scenario("when every rung is too small, routing refuses instead of sending an oversized request", () => {
 	// Two ~37K-token turns outgrow the only model's 64K window on the second turn.
 	const home = makeHome("compact-fallback");
-	const prompts = [`Remember: ${"lorem ipsum dolor sit amet ".repeat(5500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(5500)}`];
+	const prompts = [`Remember: ${"lorem ipsum dolor sit amet ".repeat(4500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(4500)}`];
 	const r = runPi(home, { model: "tier/small", prompt: prompts });
 	const compaction = sessionEntries(home).find((e) => e.type === "compaction");
 	r.compaction = compaction && { tokensBefore: compaction.tokensBefore };
@@ -997,7 +1002,7 @@ scenario("actual manual compaction persists a checkpoint with the real session c
 	const out = join(home, "compaction.json");
 	const r = runPi(home, {
 		model: "tier/default",
-		prompt: [`Remember: ${"lorem ipsum dolor sit amet ".repeat(5500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(5500)}`, "/compact-probe"],
+		prompt: [`Remember: ${"lorem ipsum dolor sit amet ".repeat(4500)}`, `Summarize: ${"consectetur adipiscing elit ".repeat(4500)}`, "/compact-probe"],
 		plan: process.env.E2E_COMPACTION_BILLING ? { "fake-a/m1": ["ok", "ok", "billing"] } : {},
 		env: { COMPACT_OUT: out },
 		extra: ["-e", join(ROOT, "test/e2e/compact-probe.ts")],
