@@ -1,8 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
-import { isRetryableAssistantError } from "@earendil-works/pi-ai/utils/retry";
+import { type AssistantMessage, isRetryableAssistantError, type Message } from "@earendil-works/pi-ai";
 import {
 	type ExtensionAPI,
 	type ExtensionContext,
