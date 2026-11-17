@@ -23,7 +23,7 @@ const FORBIDDEN = /\b403\b|forbidden|access is disabled|not allowed|FreeTierErro
 const RATE = /\b429\b|rate.?limit|too many requests|resource.?exhausted/i;
 const SERVER = /overloaded|\b5\d\d\b|server.?error|internal.?error|unavailable|at capacity/i;
 const NETWORK =
-	/timed? ?out|timeout|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ENOTFOUND|EAI_AGAIN|getaddrinfo|fetch failed|socket hang up|socket connection was closed|other side closed|connection (?:error|lost|refused)|network|terminated/i;
+	/timed? ?out|timeout|ECONNRESET|ECONNREFUSED|ECONNABORTED|EPIPE|ENOTFOUND|EAI_AGAIN|getaddrinfo|fetch failed|socket hang up|socket connection was closed|other side closed|connection (?:error|lost|refused)|network|terminated|websocket.?closed|websocket.?error|websocket stream closed before response\.completed|stream ended before a terminal response event|stream disconnected before completion/i;
 
 /**
  * A request that never got an HTTP error back: a timeout or a dropped connection. It says nothing about
@@ -31,7 +31,14 @@ const NETWORK =
  */
 export function isTransient(errorMessage: string, response: ResponseInfo | undefined): boolean {
 	const status = response?.status ?? 0;
-	return (status === 0 || status < 400) && NETWORK.test(errorMessage) && !USAGE.test(errorMessage) && !RATE.test(errorMessage);
+	return (
+		(status === 0 || status < 400) &&
+		NETWORK.test(errorMessage) &&
+		!USAGE.test(errorMessage) &&
+		!RATE.test(errorMessage) &&
+		!AUTH.test(errorMessage) &&
+		!FORBIDDEN.test(errorMessage)
+	);
 }
 
 const MIN_MS = 10_000;
