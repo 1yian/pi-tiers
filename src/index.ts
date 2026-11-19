@@ -523,11 +523,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const ready = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
 			const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
 			const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
+			const narrowed = req.reason === "direct" || excluded.size > 0;
+			const check = checker(ctx, tokens, nowMs, true, pool === low);
 			const scored = assign({
-				candidates: req.reason === "direct" || excluded.size ? pool : candidates,
-
+				candidates: narrowed ? pool : candidates,
 				payg: cfg.payg,
-				check: checker(ctx, tokens, nowMs, true, pool === low),
+				check,
 				score: (c) => {
 					const l = load.of(c.provider, nowMs, sessionId);
 					return l.utilization * UTILIZATION_WEIGHT + l.agents + l.tokens / TOKENS_PER_AGENT;
@@ -542,6 +543,15 @@ export default function piTiers(pi: ExtensionAPI): void {
 				load: loadOf,
 				seed: seedOf(sessionId),
 			});
+			if (narrowed)
+				scored.skipped.unshift(
+					...candidates
+						.filter((c) => !pool.includes(c))
+						.flatMap((c) => {
+							const reason = check(c);
+							return reason ? [{ key: candidateKey(c), reason }] : [];
+						}),
+				);
 			if (req.reason === "direct" || candidates[0]?.position === 0) return scored;
 			// The tier is known; now the classifier chooses the provider from the tier's own usable candidates,
 			// subscriptions first. Code validates the answer and falls back to the ranked pick above.
