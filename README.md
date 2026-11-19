@@ -19,7 +19,7 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 - **Sticky per session and tier.** The session keeps its model for that tier, including follow-ups, new messages, and direct requests such as compaction, keeping prompt caches warm. An oversized request moves to a fitting model or stops safely.
 - **Rules** replace or filter chains by git remote or working directory, for example "work repos only use the work account".
 - **Forced rules.** `PI_TIERS_RULE=<name>` applies that rule wherever Pi runs, for example a `vertex-pi` wrapper that keeps a session on one cloud. An unknown name fails closed.
-- **Context-aware.** When a session picks its model, one whose context window cannot hold the conversation is skipped instead of forcing a compaction. The request is sized from the last real response's reported usage plus the messages after it, not from Pi's whole-session estimate, so an edited context cannot make a healthy account look too small.
+- **Context-aware.** When a session picks its model, one whose context window cannot hold the conversation is skipped instead of forcing a compaction. The request is sized from the last real response's reported usage plus the messages after it, not from Pi's whole-session estimate, so an edited context cannot make a healthy account look too small. The window is the model's declared `contextWindow` (in Pi's `models.json`, for a custom model), so a slow or local model that should only take smaller requests declares that smaller number there. A request no entry can hold, direct ones included, is refused before it is sent, and the error names each entry's reason.
 
 ## Install
 

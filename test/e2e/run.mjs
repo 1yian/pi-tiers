@@ -526,6 +526,31 @@ scenario("direct requests stop safely when every account is cooling", () => {
 	return check(results.join() === "tier/compact:error,tier/compact:error" && r.calls.length === 0, r);
 });
 
+scenario("direct requests refuse a last entry too small for the request and name why, and use it for a small one", () => {
+	const home = withTiers(makeHome("direct-last-small"), (t) => {
+		t.tiers.compact.chain = ["fake-c/m1:low", "fake-small/tiny:low"];
+	});
+	coolFromOtherProcess(home, "account:fake-c", 120_000);
+	const probe = (name, env) => {
+		const out = join(home, `${name}.json`);
+		const r = runPi(home, { model: "tier/default", prompt: "/direct-probe compact", env: { DIRECT_OUT: out, ...env }, extra: ["-e", DIRECT] });
+		r.direct = JSON.parse(readFileSync(out, "utf8")).results;
+		return r;
+	};
+	const oversize = probe("oversize", { DIRECT_TOKENS: "100000" });
+	const small = probe("small", {});
+	const refused = oversize.routes.at(-1);
+	return check(
+		oversize.direct.join() === "tier/compact:error,tier/compact:error" &&
+			oversize.calls.length === 0 &&
+			refused?.chosen === null &&
+			refused.skipped.map((s) => `${s.key}:${s.reason}`).join() === "fake-c/m1:cooling,fake-small/tiny:context-too-small" &&
+			small.direct.join() === "fake-small/tiny:stop,fake-small/tiny:stop" &&
+			small.calls.join() === "fake-small/tiny:ok,fake-small/tiny:ok",
+		{ oversize, small },
+	);
+});
+
 scenario("with spread on, sessions start on different accounts of a group", () => {
 	const home = withTiers(makeHome("spread"), (t) => {
 		t.spread = true;
