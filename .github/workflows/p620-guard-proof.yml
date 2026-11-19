@@ -1,0 +1,17 @@
+name: p620-guard-proof
+on:
+  push:
+    branches: ['p620-guard/**']
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) && fromJSON('["self-hosted","p620-ci"]') || 'ubuntu-latest' }}
+    steps:
+      - run: echo "event=${{ github.event_name }} head=${{ github.event.pull_request.head.repo.full_name || github.repository }} repo=${{ github.repository }} runner=$RUNNER_NAME"
+  guard-simulated-fork:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == 'attacker/fork') && fromJSON('["self-hosted","p620-ci"]') || 'ubuntu-latest' }}
+    steps:
+      - run: echo "event=${{ github.event_name }} simulated fork head=attacker/fork runner=$RUNNER_NAME"
