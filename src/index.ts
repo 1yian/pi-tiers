@@ -415,13 +415,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const check = checker(ctx, lastTokens, nowMs, true, true);
 		const result = pick({ candidates: pool, check });
 		if (!result.chosen) {
-			const withRoom = candidates.filter((c) => {
-				const reading = quota?.latest.get(c.provider);
-				return (reading && roomFor(reading, c.model)) !== 0;
-			});
-			return keyOf(assign({ candidates: withRoom, check, score: () => 0, freeAt: freeAtOf(nowMs), contextWindow: windowOf(ctx), payg: cfg.payg }));
+			return keyOf(assign({ candidates: candidates.filter(hasRoom), check, score: () => 0, freeAt: freeAtOf(nowMs), contextWindow: windowOf(ctx), payg: cfg.payg }));
 		}
 		return keyOf(result);
+	};
+
+	const hasRoom = (c: Candidate) => {
+		const reading = quota?.latest.get(c.provider);
+		return (reading && roomFor(reading, c.model)) !== 0;
 	};
 
 	const freeAtOf = (nowMs: number) => (c: Candidate) => {
@@ -579,9 +580,10 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const low = eligible.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
 			const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
 			const narrowed = req.reason === "direct" || (excluded.size > 0 && pool.length > 0);
+			const widened = excluded.size > 0 && pool.length === 0 && req.reason !== "direct";
 			const check = checker(ctx, tokens, nowMs, true, pool === low);
 			const scored = assign({
-				candidates: narrowed ? pool : eligible,
+				candidates: narrowed ? pool : widened ? eligible.filter(hasRoom) : eligible,
 				payg: cfg.payg,
 				check,
 				score: (c) => {
