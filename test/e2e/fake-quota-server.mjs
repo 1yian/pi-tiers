@@ -1,6 +1,7 @@
 // Fake quota endpoint for the end-to-end suite, shaped like Anthropic's api/oauth/usage.
 // Usage: node fake-quota-server.mjs <plan.json> <requests.log>
-// The plan maps a bearer token to {five, seven, status, delayMs}; it is re-read on every request.
+// The plan maps a bearer token to {five, seven, sevenHours, fable, status, delayMs}; it is re-read on every request.
+// sevenHours is how far away the 7d reset is (default 1); fable adds a model-scoped "Claude Fable" weekly window with that percent left.
 // A spec with `later` and `after: N` reports `later` from the Nth request on (a quota used up mid-session).
 // Each request appends its token to the log. Prints the listening port on its first line.
 import { appendFileSync, readFileSync, statSync } from "node:fs";
@@ -24,8 +25,14 @@ createServer((req, res) => {
 			res.writeHead(spec.status).end("{}");
 			return;
 		}
-		const window = (used) => ({ utilization: used, resets_at: new Date(Date.now() + 3600_000).toISOString() });
-		res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ five_hour: window(100 - spec.five), seven_day: window(100 - spec.seven) }));
+		const resetsAt = (hours) => new Date(Date.now() + hours * 3600_000).toISOString();
+		const window = (used, hours = 1) => ({ utilization: used, resets_at: resetsAt(hours) });
+		const body = { five_hour: window(100 - spec.five), seven_day: window(100 - spec.seven, spec.sevenHours) };
+		if (spec.fable !== undefined)
+			body.limits = [
+				{ kind: "weekly_scoped", percent: 100 - spec.fable, scope: { model: { display_name: "Claude Fable" } }, resets_at: resetsAt(spec.sevenHours ?? 1) },
+			];
+		res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(body));
 	}, spec.delayMs ?? 0);
 }).listen(0, "127.0.0.1", function () {
 	console.log(this.address().port);

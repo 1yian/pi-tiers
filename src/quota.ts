@@ -34,9 +34,15 @@ export interface QuotaReading {
 	atMs: number;
 }
 
+export interface SpendBeforeReset {
+	model: string;
+	withinHours: number;
+}
+
 export interface QuotaConfig {
 	/** An account with less than this much left in a window is not usable for a new session. */
 	minRemainingPercent: number;
+	spendBeforeReset?: SpendBeforeReset;
 	/** Total time a session start may spend waiting for readings. */
 	timeoutMs: number;
 	cacheSeconds: number;
@@ -47,6 +53,8 @@ export interface QuotaConfig {
 	/** Prepaid xAI credit that counts as "full", to express a dollar balance as a percentage. */
 	xaiReferenceUsd: number;
 }
+
+export const DEFAULT_SPEND_WITHIN_HOURS = 24;
 
 export const DEFAULT_QUOTA: QuotaConfig = {
 	minRemainingPercent: 5,
@@ -74,6 +82,16 @@ export function roomFor(reading: QuotaReading, model: string): number | undefine
 	const lower = model.toLowerCase();
 	const applicable = reading.windows.filter((w) => !w.scope || lower.includes(w.scope));
 	return applicable.length ? Math.min(...applicable.map((w) => w.remainingPercent)) : undefined;
+}
+
+export function weeklyExpiring(reading: QuotaReading, model: string, spend: SpendBeforeReset, floor: number, nowMs: number): boolean {
+	const lower = model.toLowerCase();
+	const weekly = reading.windows.find((w) => w.label === "7d" && !w.scope);
+	const scoped = reading.windows.find((w) => w.scope && lower.includes(w.scope));
+	if (!weekly?.resetAtMs || !scoped) return false;
+	const untilReset = weekly.resetAtMs - nowMs;
+	const roomy = (w: QuotaWindow) => w.remainingPercent > 0 && w.remainingPercent >= floor;
+	return untilReset > 0 && untilReset <= spend.withinHours * 3_600_000 && roomy(weekly) && roomy(scoped);
 }
 
 /** When the window that is under `minPercent` for this model frees up, if known. */

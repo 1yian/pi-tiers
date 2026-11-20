@@ -3,7 +3,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_QUOTA, type QuotaConfig, type QuotaKind } from "./quota.ts";
+import { DEFAULT_QUOTA, DEFAULT_SPEND_WITHIN_HOURS, type QuotaConfig, type QuotaKind, type SpendBeforeReset } from "./quota.ts";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type Thinking = (typeof THINKING_LEVELS)[number];
@@ -211,7 +211,15 @@ export function parseConfig(raw: unknown, path: string, agentDir: string): Confi
 		for (const name of ["anthropic", "codex", "xai", "xaiManagement"] as const)
 			if (urls[name] !== undefined) baseUrls[name] = str(urls[name], `quota.baseUrls.${name}`);
 		const xai = obj(q.xai ?? {}, "quota.xai");
+		let spendBeforeReset: SpendBeforeReset | undefined;
+		if (q.spendBeforeReset !== undefined) {
+			const s = obj(q.spendBeforeReset, "quota.spendBeforeReset");
+			const withinHours = num(s.withinHours, "quota.spendBeforeReset.withinHours", DEFAULT_SPEND_WITHIN_HOURS);
+			if (withinHours === 0) fail("quota.spendBeforeReset.withinHours", "expected a positive number");
+			spendBeforeReset = { model: str(s.model, "quota.spendBeforeReset.model"), withinHours };
+		}
 		quota = {
+			spendBeforeReset,
 			minRemainingPercent: percent,
 			timeoutMs: num(q.timeoutSeconds, "quota.timeoutSeconds", DEFAULT_QUOTA.timeoutMs / 1000) * 1000,
 			cacheSeconds: num(q.cacheSeconds, "quota.cacheSeconds", DEFAULT_QUOTA.cacheSeconds),

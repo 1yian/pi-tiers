@@ -131,7 +131,7 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: "https://fake.invalid",
 			apiKey: `key-${provider}`,
 			api: "fake-api",
-			models: [chat("m1", Number(process.env.FAKE_CONTEXT ?? 200_000)), chat("m2")],
+			models: [chat("m1", Number(process.env.FAKE_CONTEXT ?? 200_000)), chat("m2"), chat("fable-1")],
 			streamSimple: stream,
 		});
 	}
