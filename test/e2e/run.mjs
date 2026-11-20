@@ -848,6 +848,17 @@ scenario("a banked reset: live room before the old reset time clears the usage-l
 	return check(ok, { cleared, held, stillOut });
 });
 
+scenario("every candidate cooling never assigns an account whose live credits reading is at 0%, even the one that frees first", () => {
+	setQuota({ "fake-b": { credits: 0 } });
+	const home = withQuota(makeHome("alldown-credits"), { providers: { "fake-b": "xai" }, baseUrls: { xai: `http://127.0.0.1:${quotaPort}` } });
+	coolFromOtherProcess(home, "account:fake-a", 120_000);
+	coolFromOtherProcess(home, "account:fake-b", 30_000, "999998");
+	coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	const reading = r.routes.at(-1)?.quota?.["fake-b"]?.windows?.[0];
+	return check(answered(r) === "fake-c/m2" && reading?.label === "credits" && reading.left === 0, r);
+});
+
 scenario("a firm usage-limit mark clears when the weekly window has refilled since it was set, and holds when the window is unchanged", () => {
 	const mark = { firm: true, atMs: Date.now() - 3600_000 };
 	setQuota({ "fake-a": { five: 90, seven: 90, sevenHours: 192 }, "fake-b": { five: 40, seven: 40 } });

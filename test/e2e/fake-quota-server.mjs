@@ -2,6 +2,7 @@
 // Usage: node fake-quota-server.mjs <plan.json> <requests.log>
 // The plan maps a bearer token to {five, seven, sevenHours, fable, status, delayMs}; it is re-read on every request.
 // sevenHours is how far away the 7d reset is (default 1); fable adds a model-scoped "Claude Fable" weekly window with that percent left.
+// credits answers in the shape of xAI's billing credits endpoint instead, with that percent of credits left.
 // A spec with `later` and `after: N` reports `later` from the Nth request on (a quota used up mid-session).
 // Each request appends its token to the log. Prints the listening port on its first line.
 import { appendFileSync, readFileSync, statSync } from "node:fs";
@@ -23,6 +24,10 @@ createServer((req, res) => {
 	setTimeout(() => {
 		if (spec.status && spec.status !== 200) {
 			res.writeHead(spec.status).end("{}");
+			return;
+		}
+		if (spec.credits !== undefined) {
+			res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ config: { creditUsagePercent: 100 - spec.credits } }));
 			return;
 		}
 		const resetsAt = (hours) => new Date(Date.now() + hours * 3600_000).toISOString();
