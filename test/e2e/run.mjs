@@ -275,6 +275,53 @@ scenario("every candidate cooling still assigns the one that frees first, instea
 	return check(answered(r) === "fake-b/m1" && r.calls.length === 1, r);
 });
 
+scenario("every candidate cooling never assigns an exhausted account, even the one that frees first, and refuses when all are exhausted", () => {
+	const firm = runPi(
+		(() => {
+			const home = makeHome("alldown-firm");
+			coolFromOtherProcess(home, "account:fake-a", 120_000);
+			coolFromOtherProcess(home, "account:fake-b", 30_000, "999998", { firm: true });
+			coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+			return home;
+		})(),
+		{ model: "tier/default", prompt: "hello" },
+	);
+	const auth = runPi(
+		(() => {
+			const home = makeHome("alldown-auth");
+			coolFromOtherProcess(home, "account:fake-a", 120_000);
+			coolFromOtherProcess(home, "account:fake-b", 30_000, "999998", { reason: "auth" });
+			coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+			return home;
+		})(),
+		{ model: "tier/default", prompt: "hello" },
+	);
+	const allHome = makeHome("alldown-exhausted");
+	coolFromOtherProcess(allHome, "account:fake-a", 120_000, "999999", { firm: true });
+	coolFromOtherProcess(allHome, "account:fake-b", 30_000, "999998", { reason: "auth" });
+	coolFromOtherProcess(allHome, "account:fake-c", 60_000, "999997", { firm: true });
+	const none = runPi(allHome, { model: "tier/default", prompt: "hello" });
+	const ok = answered(firm) === "fake-c/m2" && answered(auth) === "fake-c/m2" && none.final?.stopReason === "error" && none.calls.length === 0;
+	return check(ok, { firm, auth, none });
+});
+
+scenario("a 403 on the active account while every other account is cooling continues on the best one that is not exhausted", () => {
+	const home = makeHome("forbidden-all-cooling");
+	coolFromOtherProcess(home, "account:fake-b", 60_000, "999998");
+	coolFromOtherProcess(home, "account:fake-c", 120_000, "999997");
+	const plain = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	const exhaustedHome = makeHome("forbidden-all-cooling-exhausted");
+	coolFromOtherProcess(exhaustedHome, "account:fake-b", 60_000, "999998", { firm: true });
+	coolFromOtherProcess(exhaustedHome, "account:fake-c", 120_000, "999997");
+	const skipped = runPi(exhaustedHome, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	const ok =
+		answered(plain) === "fake-b/m1" &&
+		plain.calls.join() === "fake-a/m1:403,fake-b/m1:ok" &&
+		answered(skipped) === "fake-c/m2" &&
+		skipped.calls.join() === "fake-a/m1:403,fake-c/m2:ok";
+	return check(ok, { plain, skipped });
+});
+
 scenario("a session starts on the least loaded account: live agents and reported quota use count", () => {
 	const home = makeHome("load");
 	mkdirSync(join(home, "tiers/load"), { recursive: true });
@@ -388,9 +435,9 @@ function withTiers(home, change) {
 }
 
 /** Cools a key as another Pi process would, for the given number of milliseconds from now. */
-function coolFromOtherProcess(home, key, ms, file = "999999") {
+function coolFromOtherProcess(home, key, ms, file = "999999", mark = {}) {
 	mkdirSync(join(home, "tiers/cooldowns"), { recursive: true });
-	writeFileSync(join(home, `tiers/cooldowns/${file}.json`), JSON.stringify({ [key]: { untilMs: Date.now() + ms, reason: "usage-limit" } }));
+	writeFileSync(join(home, `tiers/cooldowns/${file}.json`), JSON.stringify({ [key]: { untilMs: Date.now() + ms, reason: "usage-limit", ...mark } }));
 }
 
 scenario("a timeout is retried on the same account, where the prompt cache is, instead of moving to the next one", () => {
@@ -799,6 +846,39 @@ scenario("a banked reset: live room before the old reset time clears the usage-l
 		answered(stillOut) === "fake-b/m1" &&
 		stillOut.cleared.length === 0;
 	return check(ok, { cleared, held, stillOut });
+});
+
+scenario("every candidate cooling never assigns an account whose live credits reading is at 0%, even the one that frees first", () => {
+	setQuota({ "fake-b": { credits: 0 } });
+	const home = withQuota(makeHome("alldown-credits"), { providers: { "fake-b": "xai" }, baseUrls: { xai: `http://127.0.0.1:${quotaPort}` } });
+	coolFromOtherProcess(home, "account:fake-a", 120_000);
+	coolFromOtherProcess(home, "account:fake-b", 30_000, "999998");
+	coolFromOtherProcess(home, "account:fake-c", 60_000, "999997");
+	const r = runPi(home, { model: "tier/default", prompt: "hello" });
+	const reading = r.routes.at(-1)?.quota?.["fake-b"]?.windows?.[0];
+	return check(answered(r) === "fake-c/m2" && reading?.label === "credits" && reading.left === 0, r);
+});
+
+scenario("a firm usage-limit mark clears when the weekly window has refilled since it was set, and holds when the window is unchanged", () => {
+	const mark = { firm: true, atMs: Date.now() - 3600_000 };
+	setQuota({ "fake-a": { five: 90, seven: 90, sevenHours: 192 }, "fake-b": { five: 40, seven: 40 } });
+	const refilled = withQuota(makeHome("firm-refilled"));
+	coolFromOtherProcess(refilled, "account:fake-a", 3600_000, "999999", mark);
+	const cleared = runPi(refilled, { model: "tier/default", prompt: "hello" });
+	setQuota({ "fake-a": { five: 90, seven: 90, sevenHours: 100 }, "fake-b": { five: 40, seven: 40 } });
+	const same = withQuota(makeHome("firm-same-window"));
+	coolFromOtherProcess(same, "account:fake-a", 3600_000, "999999", mark);
+	const held = runPi(same, { model: "tier/default", prompt: "hello" });
+	const ok = answered(cleared) === "fake-a/m1" && cleared.cleared[0]?.key === "account:fake-a" && answered(held) === "fake-b/m1" && held.cleared.length === 0;
+	return check(ok, { cleared, held });
+});
+
+scenario("recovery after a 403 with every other account cooling skips an account whose live reading shows no room", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 90, seven: 90 }, "fake-c": { five: 0, seven: 90 } });
+	const home = withQuota(makeHome("forbidden-zero-room"));
+	coolFromOtherProcess(home, "account:fake-b", 2 * 3600_000, "999998", { reason: "rate-limit" });
+	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:403,fake-b/m1:ok", r);
 });
 
 scenario(

@@ -68,7 +68,7 @@ export function subscriptionsFirst<T extends { provider: string }>(candidates: r
 	return [...candidates.filter((c) => !payg.has(c.provider)), ...candidates.filter((c) => payg.has(c.provider))];
 }
 
-export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "quota-low" | "context-too-small";
+export type SkipReason = "unknown-model" | "no-credentials" | "exhausted" | "cooling" | "quota-low" | "context-too-small";
 
 export interface PickInput {
 	candidates: Candidate[];
@@ -133,7 +133,8 @@ export const ROOM_BAND = 10;
  * Chooses the one candidate a session commits to. The chain is a preference order of models: the
  * first chain entry with a usable account wins, and within it the least loaded account. A cooldown
  * is evidence the account is exhausted, so it ranks a candidate last but never removes it, because
- * a stale or wrong cooldown must not leave the session without a model.
+ * a stale or wrong cooldown must not leave the session without a model. The one exception is an
+ * exhausted account (firm or auth cooldown, credits at 0%): it is skipped even when all else cools.
  */
 export function assign({ candidates, check, score, freeAt, contextWindow, room, load, seed, payg }: AssignInput): PickResult {
 	const skipped: PickResult["skipped"] = [];

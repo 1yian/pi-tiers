@@ -58,6 +58,7 @@ const TRANSIENT_ATTEMPTS = 2;
  * quota already used (0..1) outweighs a whole agent, and 500K recent tokens count as one agent. */
 const UTILIZATION_WEIGHT = 10;
 const TOKENS_PER_AGENT = 500_000;
+const WEEK_MS = 7 * 24 * 3600_000;
 
 interface Override {
 	provider: string;
@@ -190,9 +191,12 @@ export default function piTiers(pi: ExtensionAPI): void {
 			if (!model) return "unknown-model";
 			if (!ctx.modelRegistry.hasConfiguredAuth(model)) return "no-credentials";
 			if (tokens && model.contextWindow && model.contextWindow < tokens + CONTEXT_HEADROOM) return "context-too-small";
-			if (store.get(accountKey(c.provider), nowMs) || store.get(modelKey(c.provider, c.model), nowMs)) return "cooling";
+			const accountMark = store.get(accountKey(c.provider), nowMs);
+			const reading = useQuota && quota && cfg.quota ? quota.latest.get(c.provider) : undefined;
+			if (accountMark?.firm || accountMark?.reason === "auth" || reading?.windows.some((w) => w.remainingPercent <= 0 && /^(credits|prepaid)$/.test(w.label)))
+				return "exhausted";
+			if (accountMark || store.get(modelKey(c.provider, c.model), nowMs)) return "cooling";
 			if (useQuota && quota && cfg.quota) {
-				const reading = quota.latest.get(c.provider);
 				const room = reading && roomFor(reading, c.model);
 				if (room !== undefined && (room <= 0 || (!allowLow && room < cfg.quota.minRemainingPercent))) return "quota-low";
 			}
@@ -229,7 +233,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 		for (const [provider, o] of outcomes) {
 			if (!("reading" in o)) continue;
 			const mark = store.get(accountKey(provider), nowMs);
-			if (mark?.reason !== "usage-limit" || mark.firm || (mark.atMs ?? 0) > o.reading.atMs) continue;
+			if (mark?.reason !== "usage-limit" || (mark.atMs ?? 0) > o.reading.atMs) continue;
+			if (mark.firm && !weeklyRefilledSince(o.reading, mark.atMs ?? 0)) continue;
 			const room = accountRoom(o.reading);
 			if (room === undefined || room <= 0) continue;
 			store.clear(accountKey(provider), o.reading.atMs);
@@ -406,9 +411,28 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const ready = candidates.filter((c) => !checker(ctx, lastTokens, Date.now(), true)(c));
 		const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, lastTokens, Date.now(), true, true)(c));
 		const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
-		const result = pick({ candidates: pool, check: checker(ctx, lastTokens, Date.now(), true, true) });
-		return result.chosen && !result.compacting ? candidateKey(result.chosen) : undefined;
+		const nowMs = Date.now();
+		const check = checker(ctx, lastTokens, nowMs, true, true);
+		const result = pick({ candidates: pool, check });
+		if (!result.chosen) {
+			return keyOf(
+				assign({ candidates: candidates.filter(hasRoom), check, score: () => 0, freeAt: freeAtOf(nowMs), contextWindow: windowOf(ctx), payg: cfg.payg }),
+			);
+		}
+		return keyOf(result);
 	};
+
+	const hasRoom = (c: Candidate) => {
+		const reading = quota?.latest.get(c.provider);
+		return (reading && roomFor(reading, c.model)) !== 0;
+	};
+
+	const freeAtOf = (nowMs: number) => (c: Candidate) => {
+		const reading = quota?.latest.get(c.provider);
+		const quotaFree = (reading && cfg.quota && exhaustedUntilMs(reading, c.model, cfg.quota.minRemainingPercent)) || 0;
+		return Math.max(store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs), quotaFree);
+	};
+	const keyOf = (result: PickResult) => (result.chosen && !result.compacting ? candidateKey(result.chosen) : undefined);
 
 	const publish = (ctx: ExtensionContext, status: RouteStatus | undefined, text?: string) => {
 		ctx.ui.setStatus(STATUS_KEY, text ?? (status ? formatStatus(status) : undefined));
@@ -557,21 +581,18 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const ready = eligible.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
 			const low = eligible.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
 			const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
-			const narrowed = req.reason === "direct" || excluded.size > 0;
+			const narrowed = req.reason === "direct" || (excluded.size > 0 && pool.length > 0);
+			const widened = excluded.size > 0 && pool.length === 0 && req.reason !== "direct";
 			const check = checker(ctx, tokens, nowMs, true, pool === low);
 			const scored = assign({
-				candidates: narrowed ? pool : eligible,
+				candidates: narrowed ? pool : widened ? eligible.filter(hasRoom) : eligible,
 				payg: cfg.payg,
 				check,
 				score: (c) => {
 					const l = load.of(c.provider, nowMs, sessionId);
 					return l.utilization * UTILIZATION_WEIGHT + l.agents + l.tokens / TOKENS_PER_AGENT;
 				},
-				freeAt: (c) => {
-					const reading = quota?.latest.get(c.provider);
-					const quotaFree = (reading && cfg.quota && exhaustedUntilMs(reading, c.model, cfg.quota.minRemainingPercent)) || 0;
-					return Math.max(store.freeAt([accountKey(c.provider), modelKey(c.provider, c.model)], nowMs), quotaFree);
-				},
+				freeAt: freeAtOf(nowMs),
 				contextWindow: windowOf(ctx),
 				room: roomOf,
 				load: loadOf,
@@ -907,6 +928,11 @@ export default function piTiers(pi: ExtensionAPI): void {
 function accountRoom(reading: QuotaReading): number | undefined {
 	const windows = reading.windows.filter((w) => !w.scope);
 	return windows.length ? Math.min(...windows.map((w) => w.remainingPercent)) : undefined;
+}
+
+function weeklyRefilledSince(reading: QuotaReading, sinceMs: number): boolean {
+	const weekly = reading.windows.find((w) => w.label === "7d" && !w.scope);
+	return weekly?.resetAtMs !== undefined && weekly.resetAtMs - WEEK_MS > sinceMs;
 }
 
 function parseOverride(pattern: RegExp, text: string): Override | null {
