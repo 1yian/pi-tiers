@@ -415,7 +415,9 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const check = checker(ctx, lastTokens, nowMs, true, true);
 		const result = pick({ candidates: pool, check });
 		if (!result.chosen) {
-			return keyOf(assign({ candidates: candidates.filter(hasRoom), check, score: () => 0, freeAt: freeAtOf(nowMs), contextWindow: windowOf(ctx), payg: cfg.payg }));
+			return keyOf(
+				assign({ candidates: candidates.filter(hasRoom), check, score: () => 0, freeAt: freeAtOf(nowMs), contextWindow: windowOf(ctx), payg: cfg.payg }),
+			);
 		}
 		return keyOf(result);
 	};

@@ -869,11 +869,7 @@ scenario("a firm usage-limit mark clears when the weekly window has refilled sin
 	const same = withQuota(makeHome("firm-same-window"));
 	coolFromOtherProcess(same, "account:fake-a", 3600_000, "999999", mark);
 	const held = runPi(same, { model: "tier/default", prompt: "hello" });
-	const ok =
-		answered(cleared) === "fake-a/m1" &&
-		cleared.cleared[0]?.key === "account:fake-a" &&
-		answered(held) === "fake-b/m1" &&
-		held.cleared.length === 0;
+	const ok = answered(cleared) === "fake-a/m1" && cleared.cleared[0]?.key === "account:fake-a" && answered(held) === "fake-b/m1" && held.cleared.length === 0;
 	return check(ok, { cleared, held });
 });
 
