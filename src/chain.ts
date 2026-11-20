@@ -68,7 +68,7 @@ export function subscriptionsFirst<T extends { provider: string }>(candidates: r
 	return [...candidates.filter((c) => !payg.has(c.provider)), ...candidates.filter((c) => payg.has(c.provider))];
 }
 
-export type SkipReason = "unknown-model" | "no-credentials" | "cooling" | "quota-low" | "context-too-small";
+export type SkipReason = "unknown-model" | "no-credentials" | "exhausted" | "cooling" | "quota-low" | "context-too-small";
 
 export interface PickInput {
 	candidates: Candidate[];
