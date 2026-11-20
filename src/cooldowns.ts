@@ -11,6 +11,7 @@ export interface CooldownEntry {
 	reason: string;
 	/** When the mark was set; a live quota reading taken after this can clear it. Absent on marks from older versions. */
 	atMs?: number;
+	firm?: boolean;
 }
 
 const CLEAR = "clear:";

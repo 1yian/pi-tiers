@@ -28,6 +28,20 @@ const ERRORS: Record<string, { status: number; message: string; headers?: Record
 	"403": { status: 403, message: '403: {"type":"FreeTierError","message":"free tier can only be used from within the vendor app"}' },
 };
 
+const LOCKOUT = /^lockout(-text)?(?::(\d+))?$/;
+
+function lockout(outcome: string): { status: number; message: string; headers?: Record<string, string>; silent: boolean } | undefined {
+	const match = LOCKOUT.exec(outcome);
+	if (!match) return undefined;
+	const seconds = match[2] ?? "284700";
+	return {
+		status: 429,
+		message: `Server requested ${seconds}s retry delay (max: 60s). 429 {"type":"error","error":{"type":"rate_limit_error","message":"Rate limited"}}`,
+		headers: match[1] ? undefined : { "retry-after": seconds },
+		silent: Boolean(match[1]),
+	};
+}
+
 const NO_RESPONSE: Record<string, string> = {
 	timeout: "Request timed out.",
 	connection: "Connection error.",
@@ -92,8 +106,9 @@ function stream(model: Model<Api>, context: unknown, options?: SimpleStreamOptio
 			out.end();
 			return;
 		}
-		const error = ERRORS[outcome];
-		await options?.onResponse?.({ status: error?.status ?? 200, headers: error?.headers ?? {} }, model);
+		const locked = lockout(outcome);
+		const error = locked ?? ERRORS[outcome];
+		if (!locked?.silent) await options?.onResponse?.({ status: error?.status ?? 200, headers: error?.headers ?? {} }, model);
 		if (error) {
 			message.stopReason = "error";
 			message.errorMessage = error.message;

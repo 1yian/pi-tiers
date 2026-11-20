@@ -8,6 +8,7 @@ export interface Failure {
 	/** `account` cools every model on the provider; `model` cools one model on it. */
 	scope: "account" | "model";
 	untilMs: number;
+	firm?: boolean;
 }
 
 export interface ResponseInfo {
@@ -17,6 +18,9 @@ export interface ResponseInfo {
 
 const USAGE =
 	/usage.?limit|quota|insufficient_quota|billing|out of budget|(?:run |ran )?out of credits|insufficient (?:credits|funds)|credit balance|(?:need|requires?) (?:a |an )?(?:[\w-]+ )?subscription|subscription (?:expired|inactive|required)|available balance|GoUsageLimitError|FreeUsageLimitError|subscription_sharing_usage_limit|weekly limit|(?:5|five)[- ]hour|exceed(?:ed)? your (?:account'?s )?(?:rate|usage) limit/i;
+const CREDITS =
+	/(?:run |ran )?out of credits|insufficient (?:credits|funds)|credit balance|(?:need|requires?) (?:a |an )?(?:[\w-]+ )?subscription|subscription (?:expired|inactive|required)/i;
+const REQUESTED_DELAY = /requested (\d+(?:\.\d+)?)s retry delay/i;
 const AUTH = /\b401\b|unauthori[sz]ed|invalid.?(?:api.?)?key|authentication|not logged in|token (?:has )?expired/i;
 /** 403 without an auth reason: this model is off limits for the account (disabled, free tier refused, region). */
 const FORBIDDEN = /\b403\b|forbidden|access is disabled|not allowed|FreeTierError|permission/i;
@@ -48,7 +52,10 @@ export function classifyFailure(errorMessage: string, response: ResponseInfo | u
 	const status = response?.status ?? 0;
 	const reset = response ? resetFromHeaders(response.headers, nowMs) : undefined;
 	const until = (fallbackSeconds: number) => clamp(reset ?? nowMs + fallbackSeconds * 1000, nowMs);
-	if (USAGE.test(errorMessage)) return { kind: "usage-limit", scope: "account", untilMs: until(cooldowns.usageLimitSeconds) };
+	const requested = requestedDelayMs(errorMessage, response?.headers, nowMs);
+	if ((status === 429 || RATE.test(errorMessage)) && requested !== undefined && requested > cooldowns.usageLimitSeconds * 1000)
+		return { kind: "usage-limit", scope: "account", untilMs: clamp(nowMs + requested, nowMs), firm: true };
+	if (USAGE.test(errorMessage)) return { kind: "usage-limit", scope: "account", untilMs: until(cooldowns.usageLimitSeconds), firm: CREDITS.test(errorMessage) };
 	if (status === 401 || AUTH.test(errorMessage)) return { kind: "auth", scope: "account", untilMs: until(cooldowns.authSeconds) };
 	if (status === 403 || FORBIDDEN.test(errorMessage)) return { kind: "forbidden", scope: "model", untilMs: until(cooldowns.authSeconds) };
 	if (status === 429 || RATE.test(errorMessage)) return { kind: "rate-limit", scope: "model", untilMs: until(cooldowns.rateLimitSeconds) };
@@ -63,9 +70,8 @@ export function resetFromHeaders(headers: Record<string, string>, nowMs: number)
 	for (const [name, value] of Object.entries(headers)) {
 		const key = name.toLowerCase();
 		if (key === "retry-after") {
-			const seconds = Number(value);
-			if (Number.isFinite(seconds)) times.push(nowMs + seconds * 1000);
-			else if (!Number.isNaN(Date.parse(value))) times.push(Date.parse(value));
+			const at = retryAfterAt(value, nowMs);
+			if (at !== undefined) times.push(at);
 		} else if (key.includes("reset")) {
 			const t = parseTime(value, nowMs);
 			if (t !== undefined) times.push(t);
@@ -73,6 +79,24 @@ export function resetFromHeaders(headers: Record<string, string>, nowMs: number)
 	}
 	const future = times.filter((t) => t > nowMs);
 	return future.length ? Math.min(...future) : undefined;
+}
+
+function retryAfterAt(value: string, nowMs: number): number | undefined {
+	const seconds = Number(value);
+	if (Number.isFinite(seconds)) return nowMs + seconds * 1000;
+	const date = Date.parse(value);
+	return Number.isNaN(date) ? undefined : date;
+}
+
+function requestedDelayMs(errorMessage: string, headers: Record<string, string> | undefined, nowMs: number): number | undefined {
+	const asked: number[] = [];
+	for (const [name, value] of Object.entries(headers ?? {})) {
+		const at = name.toLowerCase() === "retry-after" ? retryAfterAt(value, nowMs) : undefined;
+		if (at !== undefined) asked.push(at - nowMs);
+	}
+	const named = REQUESTED_DELAY.exec(errorMessage);
+	if (named) asked.push(Number(named[1]) * 1000);
+	return asked.length ? Math.max(...asked) : undefined;
 }
 
 function parseTime(value: string, nowMs: number): number | undefined {
