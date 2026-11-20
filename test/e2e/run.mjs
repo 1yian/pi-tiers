@@ -305,12 +305,21 @@ scenario("every candidate cooling never assigns an exhausted account, even the o
 	return check(ok, { firm, auth, none });
 });
 
-scenario("a 403 on the active account while every other account is cooling continues on the one that frees first", () => {
+scenario("a 403 on the active account while every other account is cooling continues on the best one that is not exhausted", () => {
 	const home = makeHome("forbidden-all-cooling");
 	coolFromOtherProcess(home, "account:fake-b", 60_000, "999998");
 	coolFromOtherProcess(home, "account:fake-c", 120_000, "999997");
-	const r = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
-	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:403,fake-b/m1:ok", r);
+	const plain = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	const exhaustedHome = makeHome("forbidden-all-cooling-exhausted");
+	coolFromOtherProcess(exhaustedHome, "account:fake-b", 60_000, "999998", { firm: true });
+	coolFromOtherProcess(exhaustedHome, "account:fake-c", 120_000, "999997");
+	const skipped = runPi(exhaustedHome, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["403"] } });
+	const ok =
+		answered(plain) === "fake-b/m1" &&
+		plain.calls.join() === "fake-a/m1:403,fake-b/m1:ok" &&
+		answered(skipped) === "fake-c/m2" &&
+		skipped.calls.join() === "fake-a/m1:403,fake-c/m2:ok";
+	return check(ok, { plain, skipped });
 });
 
 scenario("a session starts on the least loaded account: live agents and reported quota use count", () => {
