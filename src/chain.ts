@@ -1,5 +1,6 @@
 // Chain resolution and candidate selection. Pure apart from the lookups passed in.
 import type { ChainEntry, Config, Rule, Thinking } from "./config.ts";
+import { kindOf } from "./quota.ts";
 
 /** A concrete (account provider, model, thinking) to try, in preference order. */
 export interface Candidate {
@@ -10,6 +11,7 @@ export interface Candidate {
 	position: number;
 	/** Index of the chain entry this came from; members of one account group share it. -1 for an override. */
 	group?: number;
+	spend?: true;
 }
 
 export const candidateKey = (c: { provider: string; model: string }) => `${c.provider}/${c.model}`;
@@ -31,16 +33,29 @@ export function candidatesFor(config: Config, tier: string, rule: Rule | undefin
 	const chain: ChainEntry[] = replacement ?? config.tiers.get(tier)?.chain ?? [];
 	const allow = replacement ? undefined : rule?.allowProviders;
 	const out: Candidate[] = [];
+	const quota = config.quota;
+	const spend = quota?.spendBeforeReset;
+	let position = 0;
 	for (const [index, entry] of chain.entries()) {
 		const group = config.accounts.get(entry.provider);
 		const members = group ? rotated(group, rotate) : [entry.provider];
 		for (const provider of members) {
 			if (allow && !allow.has(provider)) continue;
 			if (skip?.has(provider)) continue;
-			out.push({ provider, model: entry.model, thinking: entry.thinking, position: out.length + 1, group: index });
+			const base: Candidate = { provider, model: entry.model, thinking: entry.thinking, position: ++position, group: index };
+			out.push(base);
+			if (quota && spend && kindOf(provider, quota) === "anthropic" && !out.some((c) => c.provider === provider && c.model === spend.model))
+				out.push({ ...base, model: spend.model, spend: true });
 		}
 	}
 	return out;
+}
+
+const rungOf = (c: Candidate) => `${c.group}\0${c.provider}`;
+
+export function settleSpend(candidates: readonly Candidate[], open: (c: Candidate) => boolean): Candidate[] {
+	const spending = new Set(candidates.filter((c) => c.spend && open(c)).map(rungOf));
+	return candidates.filter((c) => (c.spend ? spending.has(rungOf(c)) : !spending.has(rungOf(c))));
 }
 
 function rotated<T>(list: readonly T[], by: number): T[] {
@@ -140,7 +155,8 @@ export function assign({ candidates, check, score, freeAt, contextWindow, room, 
 	const usable = subscriptions.length ? subscriptions : ready;
 	if (usable.length) {
 		const first = Math.min(...usable.map((c) => c.group ?? 0));
-		const group = usable.filter((c) => (c.group ?? 0) === first);
+		const inFirst = usable.filter((c) => (c.group ?? 0) === first);
+		const group = inFirst.some((c) => c.spend) ? inFirst.filter((c) => c.spend) : inFirst;
 		// With a live reading for every account of the group, the most room left wins, then the least load;
 		// otherwise the header-based score decides as before.
 		const rooms = room && load ? group.map((c) => room(c)) : [];

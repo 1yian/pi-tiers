@@ -9,6 +9,7 @@ Work tiers for [Pi](https://github.com/earendil-works/pi). Instead of picking a 
 - **Subscriptions before pay-per-token.** Providers named in `payg` rank last in the code pick (chosen only when no subscription is usable); the classifier sees them labelled PAYG and is told to prefer subscriptions.
 - **Provider denials are authoritative.** Explicit usage denials mark the account even when live quota is unavailable or claims room. A later quota reading with room can clear a stale mark, but never clears the current operation's tried-account set. Ordinary rate limits and server failures on providers with a live reader still use confirmed quota before moving.
 - **Live quota at session start.** When a session picks its account, pi-tiers reads each candidate account's real limits once (Anthropic `api/oauth/usage`, Codex `wham/usage`, xAI billing; see [Live quota](#live-quota)) and ranks accounts by the room left in their tightest window, with live agents as the tie-breaker. The default 5% floor is a preference: when no preferred subscription fits, a context-capable subscription with positive room below the floor is allowed. Zero room and cooldowns remain unavailable to recovery and direct requests. A reading that fails or runs out of time falls back to the header-based score.
+- **Spend before reset.** With `quota.spendBeforeReset` set (see [Spend before reset](#spend-before-reset)), an Anthropic account about to reset its weekly window serves a configured model, such as Fable, in place of the model of each chain rung it appears in, so allowance the reset would discard is spent. It never applies outside that window or when either weekly window is under the floor.
 - **A restart picks again.** A session this Pi process has not routed yet picks its account at its first request, even when its session file already holds a committed model (a resumed or restarted worker), so an account that ran out in the meantime is not reused.
 - **Recovery is bounded.** Hard provider failures exclude accounts until the next user request, with at most one classifier-requested retry per account and at most 32 continuations. Recovery never introduces a PAYG fallback, changes credentials, or makes payments. With no fitting subscription left, one final error ends the operation and original provider errors remain in `failures.jsonl`.
 - **`PI_TIERS_AVOID`.** A comma-separated list of provider names exactly as pi-tiers prints them (for example `anthropic,anthropic-2`) is left out of every chain for that process, on a fresh start and on a resume; accounts are then chosen by live quota and load as usual. When nothing is left for the tier, the request fails with `pi-tiers: PI_TIERS_AVOID (...) leaves no provider for tier '<tier>'.`
@@ -50,7 +51,7 @@ See [`examples/tiers.json`](examples/tiers.json).
 | `background` | For a Pi started with `PI_TIERS_BACKGROUND=1`: `skip` lists providers it never uses. |
 
 | `spread` | `true` rotates account groups by a number from the session id, which breaks ties between equally loaded accounts differently per session. Default `false`: ties go to the first account in chain order. |
-| `quota` | Live quota at session start (on by default; `false` turns it off): `minRemainingPercent` (5), `timeoutSeconds` (3, total for all accounts), `cacheSeconds` (60), `providers` (provider id to `anthropic`, `codex`, or `xai`, for accounts the built-in names `anthropic`, `anthropic-N`, `openai-codex`, `openai-codex-N`, and `xai` do not cover), `xai.referenceUsd` (20), and `baseUrls` (endpoint overrides). |
+| `quota` | Live quota at session start (on by default; `false` turns it off): `minRemainingPercent` (5), `timeoutSeconds` (3, total for all accounts), `cacheSeconds` (60), `providers` (provider id to `anthropic`, `codex`, or `xai`, for accounts the built-in names `anthropic`, `anthropic-N`, `openai-codex`, `openai-codex-N`, and `xai` do not cover), `xai.referenceUsd` (20), `baseUrls` (endpoint overrides), and `spendBeforeReset` (`model`, required, and `withinHours`, default 24; off unless set). |
 | `stateDir` | Where cooldowns and the decision log live (default `~/.pi/agent/tiers`). |
 
 ## Live quota
@@ -69,6 +70,26 @@ An xAI API key cannot read its own balance. Create a **management key** in the x
 Providers without a reader (Vertex, Baseten) keep the header-based score. Readings are cached per account for `cacheSeconds` in `<stateDir>/quota/`, shared by every Pi process on the machine, with one process fetching while the others wait for its result; a failure is cached for 15 seconds. Accounts whose readings are within 10 points of each other tie, and ties go to the account with the fewest live agents and recent tokens, then to a per-session pick so sessions starting together spread out.
 
 Every start that read quota logs the readings and the choice: a `tier: quota ...; chose ...` entry in the session, a `quota` field on the `route` record in `log.jsonl`, and `/tiers` prints the current readings.
+
+## Spend before reset
+
+Fable shares the regular weekly pool of an Anthropic account: its own `7d fable` window is a sub-cap on that pool (50% of it), not a separate allowance, so Anthropic refuses Fable once the weekly window is spent. Ranking Fable last in a chain therefore never reaches it on the accounts where it is wanted. `quota.spendBeforeReset` spends it where it is free instead:
+
+```json
+"quota": { "spendBeforeReset": { "model": "claude-fable-5-2", "withinHours": 24 } }
+```
+
+When a session starts (or picks again after its account ran out), an Anthropic account (the built-in `anthropic`, `anthropic-N` names, or `quota.providers` entries of kind `anthropic`) qualifies when all of these hold:
+
+- its unscoped `7d` window resets within `withinHours` from now,
+- its `7d` window and the model-scoped `7d` window that matches `model` (for Fable, `7d fable`) both have more than `quota.minRemainingPercent` left, and the model-scoped window is present in the reading,
+- the model is usable on that account like any candidate: known, authenticated, not cooling, and every window it counts against, `5h` included, above the floor.
+
+A qualifying account serves `model` in place of the model of every chain rung it appears in, at that rung's own thinking level, with the rung's chain position. Code picks it, and when more than one account qualifies the one with the most room wins; the classifier is not asked, so a more crowded or fuller account elsewhere in the rung does not win it back. Otherwise nothing changes: the spend model is not a candidate, so neither code nor the classifier can pick it. Rungs of providers that are not Anthropic accounts (Vertex, Codex, xAI) and rules that leave the Anthropic accounts out are untouched. A running session keeps its model; only a session that starts or picks again inside the window switches, and one that started on the spend model stays on it.
+
+The pick is logged as `spend: true` on the `route` record and as `(weekly window resets soon)` on the session's quota line, and `/tiers` shows the spend model on the rungs a new session would use it for.
+
+The default of 24 hours is sized from the readings of a busy fleet: a whole weekly window drains at about 0.8 to 2.0 points per hour (1.35 on average, over eight 100% to 0% runs on three accounts), and the Fable cap left when an account's weekly window ran out was 7% to 100% of the cap (half of the pool), about 4 to 50 points of the pool, so a day is about what the remaining Fable cap can absorb. Raise `withinHours` to spend earlier, which moves more work onto a model that draws the shared pool faster; lower it to spend only the last hours. An account that runs out more than a day before its reset never reaches the window, and the accounts here ran out 35 to 121 hours early, so for a fleet that burns its pool that fast the rule is a safety net for slack accounts rather than a way to use more Fable.
 
 ## How a request is routed
 

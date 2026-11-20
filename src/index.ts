@@ -12,13 +12,34 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { type AutoDecision, decideTier, lastUserText, messageText } from "./auto.ts";
-import { assign, type Candidate, candidateKey, candidatesFor, type Expansion, type PickResult, pick, type SkipReason, subscriptionsFirst } from "./chain.ts";
+import {
+	assign,
+	type Candidate,
+	candidateKey,
+	candidatesFor,
+	type Expansion,
+	type PickResult,
+	pick,
+	type SkipReason,
+	settleSpend,
+	subscriptionsFirst,
+} from "./chain.ts";
 import { type Config, ConfigError, defaultConfigPath, loadConfig, type Rule, THINKING_LEVELS, type Thinking } from "./config.ts";
 import { accountKey, CooldownStore, modelKey } from "./cooldowns.ts";
 import { classifyFailure, type Failure, isTransient, type ResponseInfo, resetFromHeaders } from "./failures.ts";
 import { LoadStore, utilizationFromHeaders } from "./load.ts";
 import { askProvider, tableRow } from "./provider-pick.ts";
-import { describe as describeQuota, exhaustedUntilMs, exhaustedWindow, kindOf, type Outcome, type QuotaReading, QuotaStore, roomFor } from "./quota.ts";
+import {
+	describe as describeQuota,
+	exhaustedUntilMs,
+	exhaustedWindow,
+	kindOf,
+	type Outcome,
+	type QuotaReading,
+	QuotaStore,
+	roomFor,
+	weeklyExpiring,
+} from "./quota.ts";
 import { ErrorDecider } from "./recovery.ts";
 import { formatStatus, type RouteStatus } from "./status.ts";
 
@@ -177,6 +198,17 @@ export default function piTiers(pi: ExtensionAPI): void {
 			}
 			return undefined;
 		};
+
+	const settled = (ctx: ExtensionContext, candidates: Candidate[], tokens: number, nowMs: number): Candidate[] => {
+		const spend = cfg.quota?.spendBeforeReset;
+		if (!spend || !cfg.quota) return candidates;
+		const floor = cfg.quota.minRemainingPercent;
+		const skip = checker(ctx, tokens, nowMs, true);
+		return settleSpend(candidates, (c) => {
+			const reading = quota?.latest.get(c.provider);
+			return Boolean(reading && weeklyExpiring(reading, c.model, spend, floor, nowMs)) && !skip(c);
+		});
+	};
 
 	const quotaSummary = (outcomes: ReadonlyMap<string, Outcome>) =>
 		Object.fromEntries(
@@ -362,14 +394,15 @@ export default function piTiers(pi: ExtensionAPI): void {
 	// The router makes the final choice (the classifier among the usable ones, code as the fallback).
 	const alternative = async (ctx: ExtensionContext): Promise<string | undefined> => {
 		if (!lastTier || continues >= MAX_CONTINUES) return undefined;
-		const candidates = subscriptionsFirst(candidatesFor(cfg, lastTier, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg).filter(
+		const unread = subscriptionsFirst(candidatesFor(cfg, lastTier, ruleFor(ctx.cwd), expansion(ctx)), cfg.payg).filter(
 			(c) => !failedAccounts.has(c.provider) && !cfg.payg.has(c.provider),
 		);
 		await readQuota(
-			candidates.map((c) => c.provider),
+			unread.map((c) => c.provider),
 			ctx,
 			Date.now(),
 		);
+		const candidates = settled(ctx, unread, lastTokens, Date.now());
 		const ready = candidates.filter((c) => !checker(ctx, lastTokens, Date.now(), true)(c));
 		const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, lastTokens, Date.now(), true, true)(c));
 		const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
@@ -520,13 +553,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 				const l = load.of(c.provider, nowMs, sessionId);
 				return l.agents + l.tokens / TOKENS_PER_AGENT;
 			};
-			const ready = candidates.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
-			const low = candidates.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
+			const eligible = settled(ctx, candidates, tokens, nowMs);
+			const ready = eligible.filter((c) => !checker(ctx, tokens, nowMs, true)(c));
+			const low = eligible.filter((c) => !cfg.payg.has(c.provider) && !checker(ctx, tokens, nowMs, true, true)(c));
 			const pool = ready.some((c) => !cfg.payg.has(c.provider)) ? ready : low.length ? low : ready;
 			const narrowed = req.reason === "direct" || excluded.size > 0;
 			const check = checker(ctx, tokens, nowMs, true, pool === low);
 			const scored = assign({
-				candidates: narrowed ? pool : candidates,
+				candidates: narrowed ? pool : eligible,
 				payg: cfg.payg,
 				check,
 				score: (c) => {
@@ -545,14 +579,14 @@ export default function piTiers(pi: ExtensionAPI): void {
 			});
 			if (narrowed)
 				scored.skipped.unshift(
-					...candidates
+					...eligible
 						.filter((c) => !pool.includes(c))
 						.flatMap((c) => {
 							const reason = check(c);
 							return reason ? [{ key: candidateKey(c), reason }] : [];
 						}),
 				);
-			if (req.reason === "direct" || candidates[0]?.position === 0) return scored;
+			if (req.reason === "direct" || eligible[0]?.position === 0 || scored.chosen?.spend) return scored;
 			// The tier is known; now the classifier chooses the provider from the tier's own usable candidates,
 			// subscriptions first. Code validates the answer and falls back to the ranked pick above.
 			const usable = pool;
@@ -611,7 +645,8 @@ export default function piTiers(pi: ExtensionAPI): void {
 		lastRouteKey = chosenKey;
 		lastResponse = undefined;
 		if (req.reason !== "direct") load.assign(sessionId, chosen.provider);
-		if (quotaOutcomes.size && req.reason !== "direct") pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${chosenKey}`);
+		if (quotaOutcomes.size && req.reason !== "direct")
+			pending.push(`tier: quota ${quotaLine(quotaOutcomes)}; chose ${chosenKey}${chosen.spend ? " (weekly window resets soon)" : ""}`);
 
 		// The status line describes the conversation, so direct requests (compaction, extension calls
 		// on other tiers) are logged but never published over the session's own route.
@@ -635,6 +670,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			reason: req.reason,
 			chosen: chosenKey,
 			position: chosen.position,
+			...(chosen.spend ? { spend: true } : {}),
 			skipped: result.skipped,
 			rule: rule?.name,
 			tokens,
@@ -834,18 +870,19 @@ export default function piTiers(pi: ExtensionAPI): void {
 			const rule = ruleFor(ctx.cwd);
 			const check = checker(ctx, 0, nowMs);
 			const lines = [`pi-tiers (${cfg.path})${rule ? `, rule: ${rule.name}` : ""}`];
-			for (const name of cfg.tiers.keys()) {
-				const parts = candidatesFor(cfg, name, rule, expansion(ctx)).map((c) => {
+			const chains = [...cfg.tiers.keys()].map((name) => [name, candidatesFor(cfg, name, rule, expansion(ctx))] as const);
+			const outcomes = quota
+				? await quota.read(new Set(chains.flatMap(([, list]) => list.map((c) => c.provider))), (p) => ctx.modelRegistry.getApiKeyForProvider(p))
+				: undefined;
+			for (const [name, list] of chains) {
+				const parts = settled(ctx, list, 0, nowMs).map((c) => {
 					const reason = check(c);
 					return `${candidateKey(c)}:${c.thinking}${reason ? ` [${reason}]` : ""}`;
 				});
 				lines.push(`${name}: ${parts.join(" → ")}`);
 			}
-			if (quota) {
-				const providers = new Set([...cfg.tiers.keys()].flatMap((name) => candidatesFor(cfg, name, rule, expansion(ctx)).map((c) => c.provider)));
-				const outcomes = await quota.read(providers, (p) => ctx.modelRegistry.getApiKeyForProvider(p));
+			if (outcomes)
 				lines.push(outcomes.size ? `quota (usable above ${cfg.quota!.minRemainingPercent}% left): ${quotaLine(outcomes)}` : "quota: no readable accounts");
-			}
 			const active = store.active(nowMs);
 			lines.push(active.length ? "cooldowns:" : "cooldowns: none");
 			for (const [key, e] of active) lines.push(`  ${key} ${e.reason} until ${new Date(e.untilMs).toLocaleString()}`);

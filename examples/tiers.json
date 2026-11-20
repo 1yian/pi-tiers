@@ -29,6 +29,9 @@
       "allowProviders": ["anthropic"]
     }
   ],
+  "quota": {
+    "spendBeforeReset": { "model": "claude-fable-5-2", "withinHours": 24 }
+  },
   "override": "^Model override:\\s*(\\S+)(?:\\s+(\\S+))?",
   "warnProviders": ["opencode"],
   "payg": ["opencode"]

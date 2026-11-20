@@ -1177,6 +1177,86 @@ scenario("billing failover: direct incident-sized request takes positive room be
 	);
 });
 
+const SPEND = { spendBeforeReset: { model: "fable-1", withinHours: 24 } };
+const spendRoute = (r) => r.routes.at(-1);
+
+scenario(
+	"spend before reset: near the weekly reset, an account with room in both windows serves the spend model at the rung's thinking, whatever the room elsewhere and without asking the classifier",
+	() => {
+		setQuota({ "fake-a": { five: 90, seven: 60, sevenHours: 10, fable: 70 }, "fake-b": { five: 90, seven: 95, sevenHours: 100, fable: 90 } });
+		const home = withQuota(makeHome("spend-near"), SPEND);
+		const r = runPi(home, { model: "tier/default", prompt: "## Captain's intent\nFix the bug.", env: JEV({ choice: "fake-b/m1" }) });
+		const ok =
+			answered(r) === "fake-a/fable-1" &&
+			spendRoute(r)?.spend === true &&
+			spendRoute(r)?.position === 1 &&
+			r.jevAsked.length === 0 &&
+			r.final.thinking === "high" &&
+			r.custom.some((c) => c.endsWith("chose fake-a/fable-1 (weekly window resets soon)"));
+		return check(ok, r);
+	},
+);
+
+scenario("spend before reset: mid-week, with the reset beyond the window, picks are exactly what they were without the setting", () => {
+	setQuota({ "fake-a": { five: 90, seven: 60, sevenHours: 100, fable: 70 }, "fake-b": { five: 90, seven: 95, sevenHours: 100, fable: 90 } });
+	const spend = runPi(withQuota(makeHome("spend-mid"), SPEND), { model: "tier/default", prompt: "hello" });
+	const plain = runPi(withQuota(makeHome("spend-mid-plain")), { model: "tier/default", prompt: "hello" });
+	const ok =
+		answered(spend) === "fake-b/m1" &&
+		answered(plain) === "fake-b/m1" &&
+		!spendRoute(spend)?.spend &&
+		spend.routes.at(-1)?.position === plain.routes.at(-1)?.position;
+	return check(ok, { spend, plain });
+});
+
+scenario(
+	"spend before reset: never the spend model when the account's weekly window, its own cap, or its 5h window is under the floor, or its cap is unreadable",
+	() => {
+		const near = { five: 90, seven: 60, sevenHours: 10, fable: 70 };
+		const rival = { five: 90, seven: 30, sevenHours: 100, fable: 90 };
+		const ask = (name, a) => {
+			setQuota({ "fake-a": a, "fake-b": rival });
+			return runPi(withQuota(makeHome(`spend-${name}`), SPEND), { model: "tier/default", prompt: "hello" });
+		};
+		const cap = ask("cap", { ...near, fable: 3 });
+		const weekly = ask("weekly", { ...near, seven: 3 });
+		const fiveHour = ask("five", { ...near, five: 2 });
+		const unreadable = ask("unreadable", { ...near, fable: undefined });
+		const ok =
+			answered(cap) === "fake-a/m1" &&
+			answered(weekly) === "fake-b/m1" &&
+			answered(fiveHour) === "fake-b/m1" &&
+			answered(unreadable) === "fake-a/m1" &&
+			[cap, weekly, fiveHour, unreadable].every((r) => !r.calls.some((c) => c.includes("fable")) && !spendRoute(r)?.spend);
+		return check(ok, { cap, weekly, fiveHour, unreadable });
+	},
+);
+
+scenario("spend before reset: outside the window the classifier is not offered the spend model, and answering with it falls back to the code pick", () => {
+	setQuota({ "fake-a": { five: 90, seven: 80, sevenHours: 100, fable: 70 }, "fake-b": { five: 90, seven: 60, sevenHours: 100, fable: 90 } });
+	const r = runPi(withQuota(makeHome("spend-jev"), SPEND), { model: "tier/default", prompt: "do it", env: JEV({ choice: "fake-a/fable-1" }) });
+	const ok = answered(r) === "fake-a/m1" && r.picks[0]?.fallback === "off-list" && !rowKeys(r).some((k) => k.includes("fable"));
+	return check(ok, r);
+});
+
+scenario("spend before reset: a session that started on the spend model stays on it for its next message", () => {
+	setQuota({ "fake-a": { five: 90, seven: 60, sevenHours: 10, fable: 70 }, "fake-b": { five: 90, seven: 60, sevenHours: 100, fable: 70 } });
+	const r = runPi(withQuota(makeHome("spend-sticky"), SPEND), { model: "tier/default", prompt: ["hello", "and again"] });
+	return check(r.calls.join() === "fake-a/fable-1:ok,fake-a/fable-1:ok" && answered(r) === "fake-a/fable-1", r);
+});
+
+scenario("spend before reset: a provider that is not an anthropic account never gets the spend model, in any chain or rule", () => {
+	setQuota({
+		"fake-a": { five: 90, seven: 60, sevenHours: 10, fable: 70 },
+		"fake-b": { five: 90, seven: 60, sevenHours: 10, fable: 70 },
+		"fake-c": { five: 90, seven: 60, sevenHours: 10, fable: 70 },
+	});
+	const home = withQuota(makeHome("spend-rule"), { ...SPEND, providers: { "fake-a": "anthropic", "fake-b": "anthropic" } });
+	const r = runPi(home, { model: "tier/deep", prompt: "hello" });
+	const ruled = runPi(home, { model: "tier/default", prompt: "hello", env: { PI_TIERS_RULE: "acme" } });
+	return check(answered(r) === "fake-c/m2" && answered(ruled) === "fake-c/m2" && !r.calls.concat(ruled.calls).some((c) => c.includes("fable")), { r, ruled });
+});
+
 quotaServer.kill();
 
 const passed = results.filter((r) => r.ok).length;
