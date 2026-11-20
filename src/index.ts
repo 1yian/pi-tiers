@@ -612,6 +612,16 @@ export default function piTiers(pi: ExtensionAPI): void {
 		};
 		const known = sticky ? candidates.find((c) => candidateKey(c) === sticky) : undefined;
 		const stuck = known && ctx.modelRegistry.find(known.provider, known.model);
+		let spendClosed = false;
+		const spendCfg = cfg.quota?.spendBeforeReset;
+		if (sticky && known?.spend && spendCfg && cfg.quota) {
+			await readQuota([known.provider], ctx, nowMs);
+			const reading = quota?.latest.get(known.provider);
+			if (reading && !weeklyExpiring(reading, known.model, spendCfg, cfg.quota.minRemainingPercent, nowMs)) {
+				sticky = undefined;
+				spendClosed = true;
+			}
+		}
 		const tooSmall = Boolean(stuck?.contextWindow && stuck.contextWindow < tokens + CONTEXT_HEADROOM);
 		if (tooSmall || (req.reason === "direct" && known && checker(ctx, tokens, nowMs, true)(known))) sticky = undefined;
 		const result: PickResult =
@@ -677,6 +687,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 			...(quotaOutcomes.size ? { quota: quotaSummary(quotaOutcomes) } : {}),
 			...(result.compacting ? { compacting: true } : {}),
 			...(departed ? { departed: true } : {}),
+			...(spendClosed ? { spendClosed: true } : {}),
 			...(moved ? { left: [...failedServices] } : {}),
 		});
 

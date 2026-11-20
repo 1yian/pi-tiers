@@ -1245,6 +1245,30 @@ scenario("spend before reset: a session that started on the spend model stays on
 	return check(r.calls.join() === "fake-a/fable-1:ok,fake-a/fable-1:ok" && answered(r) === "fake-a/fable-1", r);
 });
 
+scenario("spend before reset: a session on the spend model leaves it on the next message once the window has closed, and keeps it when the reading fails", () => {
+	const near = { five: 90, seven: 60, sevenHours: 10, fable: 70 };
+	const rival = { five: 90, seven: 30, sevenHours: 100, fable: 70 };
+	const twice = (name, later) => {
+		setQuota({ "fake-a": { ...near, after: 1, later }, "fake-b": rival });
+		return runPi(withQuota(makeHome(`spend-close-${name}`), { ...SPEND, cacheSeconds: 0 }), { model: "tier/default", prompt: ["hello", "and again"] });
+	};
+	const reset = twice("reset", { ...near, sevenHours: 100 });
+	const cap = twice("cap", { ...near, fable: 3 });
+	const weekly = twice("weekly", { ...near, seven: 3 });
+	const failed = twice("failed", { status: 500 });
+	const left = (r) => r.calls[0] === "fake-a/fable-1:ok" && !r.calls[1].includes("fable") && r.routes.at(-1)?.spendClosed === true && !r.routes.at(-1)?.spend;
+	const ok =
+		left(reset) &&
+		reset.calls[1] === "fake-a/m1:ok" &&
+		left(cap) &&
+		cap.calls[1] === "fake-a/m1:ok" &&
+		left(weekly) &&
+		weekly.calls[1] === "fake-b/m1:ok" &&
+		failed.calls.join() === "fake-a/fable-1:ok,fake-a/fable-1:ok" &&
+		!failed.routes.at(-1)?.spendClosed;
+	return check(ok, { reset, cap, weekly, failed });
+});
+
 scenario("spend before reset: a provider that is not an anthropic account never gets the spend model, in any chain or rule", () => {
 	setQuota({
 		"fake-a": { five: 90, seven: 60, sevenHours: 10, fable: 70 },
