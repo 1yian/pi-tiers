@@ -1057,6 +1057,81 @@ scenario("billing failover: exact denial overrides an unavailable live quota rea
 	return check(answered(r) === "fake-b/m1" && r.calls.join() === "fake-a/m1:billing,fake-b/m1:ok" && r.cooldowns.includes("account:fake-a"), r);
 });
 
+const sleepUntil = (ms) => {
+	const wait = ms - Date.now();
+	if (wait > 0) spawnSync("sleep", [String(wait / 1000)]);
+};
+const markOf = (home, key) => {
+	const dir = join(home, "tiers/cooldowns");
+	const marks = {};
+	for (const f of existsSync(dir) ? readdirSync(dir) : []) Object.assign(marks, JSON.parse(readFileSync(join(dir, f), "utf8")));
+	return marks[key];
+};
+
+scenario("a credits 403 cools the account even when the live quota reader claims room: new sessions go elsewhere until the cooldown ends", () => {
+	setQuota({ xai: { five: 80, seven: 80 }, "fake-a": { five: 60, seven: 60 } });
+	const home = withTiers(withQuota(makeHome("credits-cooldown"), { providers: { xai: "anthropic", "fake-a": "anthropic" }, cacheSeconds: 0 }), (t) => {
+		t.tiers.default.chain = ["xai/m1:low", "fake-a/m1:low"];
+		t.cooldowns.usageLimitSeconds = 10;
+	});
+	const first = runPi(home, { model: "tier/default", prompt: "hello", plan: { "xai/m1": ["billing"] } });
+	const failedAt = Date.now();
+	const during = runPi(home, { model: "tier/default", prompt: "hello again" });
+	sleepUntil(failedAt + 11_000);
+	const after = runPi(home, { model: "tier/default", prompt: "hello once more" });
+	const ok =
+		first.calls.join() === "xai/m1:billing,fake-a/m1:ok" &&
+		first.failures[0]?.kind === "usage-limit" &&
+		during.calls.join() === "fake-a/m1:ok" &&
+		during.cleared.length === 0 &&
+		during.routes.at(-1)?.quota?.xai?.windows?.length === 2 &&
+		after.calls.join() === "xai/m1:ok";
+	return check(ok, { first, during, after });
+});
+
+scenario("a 429 asking for a long wait cools the account for that long, from its Retry-After or from the requested delay alone", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const header = withQuota(makeHome("lockout-header"));
+	const before = Date.now();
+	const first = runPi(header, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["lockout"] } });
+	const next = runPi(header, { model: "tier/default", prompt: "hello again" });
+	const text = withQuota(makeHome("lockout-text"));
+	const textOnly = runPi(text, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["lockout-text"] } });
+	const stated = (home) => {
+		const mark = markOf(home, "account:fake-a");
+		return mark?.reason === "usage-limit" && Math.abs(mark.untilMs - before - 284_700_000) < 120_000;
+	};
+	const ok =
+		first.calls.join() === "fake-a/m1:lockout,fake-b/m1:ok" &&
+		first.failures[0]?.kind === "usage-limit" &&
+		first.failures[0].retryAfter === "284700" &&
+		stated(header) &&
+		next.calls.join() === "fake-b/m1:ok" &&
+		next.cleared.length === 0 &&
+		textOnly.calls.join() === "fake-a/m1:lockout-text,fake-b/m1:ok" &&
+		stated(text);
+	return check(ok, { first, next, textOnly });
+});
+
+scenario("a locked-out account takes new sessions again once the stated delay is over, where a 429 asking for a short wait is still retried in place", () => {
+	setQuota({ "fake-a": { five: 90, seven: 90 }, "fake-b": { five: 50, seven: 50 } });
+	const home = withTiers(withQuota(makeHome("lockout-return", BACKOFF), { cacheSeconds: 0 }), (t) => {
+		t.cooldowns.usageLimitSeconds = 5;
+	});
+	const first = runPi(home, { model: "tier/default", prompt: "hello", plan: { "fake-a/m1": ["lockout:12"] } });
+	const lockedAt = Date.now();
+	const during = runPi(home, { model: "tier/default", prompt: "hello again" });
+	sleepUntil(lockedAt + 13_000);
+	const after = runPi(home, { model: "tier/default", prompt: "hello once more", plan: { "fake-a/m1": ["lockout:12", "lockout:3", "ok"] } });
+	const ok =
+		first.calls.join() === "fake-a/m1:lockout:12,fake-b/m1:ok" &&
+		during.calls.join() === "fake-b/m1:ok" &&
+		answered(after) === "fake-a/m1" &&
+		after.calls.join() === "fake-a/m1:lockout:3,fake-a/m1:ok" &&
+		after.cooldowns.length === 0;
+	return check(ok, { first, during, after });
+});
+
 scenario("billing failover: bounded account attempts never fall into PAYG", () => {
 	const home = withTiers(makeHome("billing-bounded"), (t) => {
 		t.payg = ["fake-c"];

@@ -229,7 +229,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		for (const [provider, o] of outcomes) {
 			if (!("reading" in o)) continue;
 			const mark = store.get(accountKey(provider), nowMs);
-			if (mark?.reason !== "usage-limit" || (mark.atMs ?? 0) > o.reading.atMs) continue;
+			if (mark?.reason !== "usage-limit" || mark.firm || (mark.atMs ?? 0) > o.reading.atMs) continue;
 			const room = accountRoom(o.reading);
 			if (room === undefined || room <= 0) continue;
 			store.clear(accountKey(provider), o.reading.atMs);
@@ -287,7 +287,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		const failure = classifyFailure(errorMessage, response, cfg.cooldowns, nowMs);
 		if (!failure || (live(provider) && (failure.kind === "rate-limit" || failure.kind === "server"))) return undefined;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
-		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs });
+		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs, firm: failure.firm });
 		log({ event: "failure", key, kind: failure.kind, scope: failure.scope, until: new Date(failure.untilMs).toISOString(), error: errorMessage.slice(0, 300) });
 		if (failure.kind === "auth" && notify)
 			ctx.ui.notify(`pi-tiers: ${provider} rejected its credentials; skipping it until ${new Date(failure.untilMs).toLocaleTimeString()}`, "warning");
@@ -724,7 +724,7 @@ export default function piTiers(pi: ExtensionAPI): void {
 		if (!failure) return;
 		const storeKey = failure.scope === "account" ? accountKey(provider) : modelKey(provider, model);
 		if ((store.get(storeKey, nowMs)?.untilMs ?? 0) >= failure.untilMs) return;
-		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs });
+		store.set(storeKey, { untilMs: failure.untilMs, reason: failure.kind, atMs: nowMs, firm: failure.firm });
 		log({
 			event: "failure",
 			source: "response",
